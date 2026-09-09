@@ -47,12 +47,15 @@ self-measured loop this process is not in a position to close.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import logging
 import time
 from dataclasses import dataclass
 
 import httpx
+
+from .fair_use import trusted_addresses
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +190,31 @@ class ClientClassifier:
             self._last_error = "feed returned no usable prefixes"
         return len(networks)
 
+    def gateway_networks(
+        self, extra: tuple[str, ...] = ()
+    ) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        """Every range known to belong to a host that pools users behind it.
+
+        The same two sources `classify` uses -- Anthropic's published outbound
+        range and OpenAI's published connector feed -- plus any CIDR
+        configured for a gateway we have learned about since (Smithery, Glama,
+        mcp.run publish none as of 2026-09-05). Exposed as a list so fair use
+        can ask "is this caller pooled" without re-deriving the answer from a
+        tier string that also means other things.
+
+        An unloaded OpenAI feed simply contributes nothing: ChatGPT callers
+        then get the ordinary per-client caps, which is the safe direction to
+        fail -- too small an allowance is visible and fixable, too large a one
+        is money.
+        """
+        networks = list(self._anthropic) + list(self._openai)
+        for cidr in extra:
+            try:
+                networks.append(ipaddress.ip_network(cidr))
+            except ValueError:
+                logger.warning("ignoring unparseable gateway CIDR %r", cidr)
+        return networks
+
     def classify(self, source_ip: str | None, client_name: str | None) -> str:
         if source_ip:
             try:
@@ -261,21 +289,65 @@ def decide(
     )
 
 
-def extract_source_ip(headers: dict[str, str], peer_ip: str | None) -> str | None:
-    """Best-effort client IP, honouring one proxy hop.
+#: What goes into a caller fingerprint, in this order. Three weak signals that
+#: are individually useless -- a forwarded IP that a proxy may rotate, a user
+#: agent thousands of callers share, a session id that changes per connection --
+#: and together are enough to say "these calls came from one client".
+FINGERPRINT_HEADERS = ("x-forwarded-for", "user-agent", "mcp-session-id")
 
-    Render and most PaaS front ends terminate TLS and set X-Forwarded-For, in
-    which case the peer address is the proxy, not the caller. The leftmost
-    entry is the original client. This is trusted only because the server is
-    expected to sit behind exactly one such proxy -- it is a classification
-    input, not an authentication mechanism.
+#: Hex characters kept. 12 is 48 bits: collision-free at any traffic this
+#: server will ever see, and short enough to read in a table.
+FINGERPRINT_LENGTH = 12
+
+
+def client_fingerprint(headers: dict[str, str]) -> str | None:
+    """A stable, one-way id for one caller. Reporting only, gates nothing.
+
+    Answers the question the counters could not: 79.3% of every backend call
+    this server has ever made landed inside a single 04:00Z hour, which is
+    plainly one scheduled client -- but "plainly" was an inference from the
+    shape of a time series, not a measurement, and nothing recorded who.
+
+    A hash rather than the values themselves, because an IP and a user agent
+    are the caller's data and this server has no reason to hold either. Only
+    the digest is stored, only the digest is returned by /metrics/calls, and
+    the digest cannot be turned back into any of the three inputs.
+
+    None when the request carried none of them -- stdio, tests, a direct local
+    connection -- so a fingerprint of "nothing at all" is never counted as a
+    caller.
     """
-    forwarded = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
-    real_ip = headers.get("x-real-ip") or headers.get("X-Real-IP")
-    if real_ip:
-        return real_ip.strip()
-    return peer_ip
+    parts = []
+    for name in FINGERPRINT_HEADERS:
+        value = (headers.get(name) or "").strip()
+        # The leftmost X-Forwarded-For entry is the original client, the rest
+        # are proxy hops that can change without the caller changing.
+        if name == "x-forwarded-for" and value:
+            value = value.split(",")[0].strip()
+        parts.append(value)
+    if not any(parts):
+        return None
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    return digest[:FINGERPRINT_LENGTH]
+
+
+def extract_source_ip(headers: dict[str, str], peer_ip: str | None) -> str | None:
+    """Best-effort client IP, trusting only what our own edge appended.
+
+    On Vercel (and most PaaS front ends) a proxy terminates TLS and forwards
+    the request upstream with the true client address APPENDED as the
+    RIGHTMOST X-Forwarded-For entry. The LEFTMOST entry is whatever the
+    inbound request already carried -- caller-supplied text. Trusting it (as
+    this function used to) lets any script send
+    `x-forwarded-for: 160.79.104.1` and self-declare into TIER_LLM_HOST, the
+    ad-eligible / full-cap tier, since `160.79.104.0/21` is a *published*
+    range and free to type. This must stay in lockstep with
+    fair_use.trusted_addresses -- the rightmost X-Forwarded-For entry, then
+    X-Real-IP, then the socket peer, all values the caller cannot choose --
+    reusing that exact helper rather than re-deriving the same trust
+    boundary twice. Still a classification input, not an authentication
+    mechanism: nothing here proves the edge did not merely pass a single
+    untouched hop straight through.
+    """
+    addresses = trusted_addresses(headers, peer_ip)
+    return addresses[0] if addresses else None

@@ -275,9 +275,38 @@ class TestUpgradePromptOnTruncation:
         cov = plan.coverage()
         assert cov["truncated"] is True
         msg = cov["tell_the_user"]
-        assert "https://flights.flightpowers.com/mcp" in msg
-        assert "no per-call cap" in msg
-        assert "rapidapi.com/mtnrabi" in msg
+        # Sign-in first (2026-09-08), the keyed URL second: several MCP
+        # clients cannot set a header at all.
+        assert "https://flights.flightpowers.com/mcp/oauth" in msg
+        assert msg.index("/mcp/oauth") < msg.index("x-rapidapi-key")
+        assert "https://flights.flightpowers.com/mcp in an" in msg
+        # The FLIGHTS listing, not the provider profile: the profile lists
+        # three APIs, one of which is the bulk hotels listing we do not
+        # market, and it puts a choice between a reader and a key.
+        assert "https://rapidapi.com/mtnrabi/api/google-flights-live-api" in msg
+        assert "rapidapi.com/mtnrabi," not in msg
+        # The step being asked for costs nothing; say so, don't hint it.
+        assert "BASIC is free" in msg
+        assert "free tier available" not in msg
+        # The paid server's real numbers, not a promise it cannot keep.
+        assert "30" in msg and "60" in msg
+        assert "max_searches" in msg
+
+    def test_the_pitch_does_not_promise_an_uncapped_paid_tier(self):
+        """The paid server caps fan-out at 30 by default and 60 hard
+        (mcp_server_paid/src/settings.py). This message used to say it had
+        "no per-call cap" and searched "the full range in one call"; a user
+        who acted on that found out after paying."""
+        plan = plan_oneway(
+            from_airport="TLV",
+            to_airport="CMB",
+            departure_date_from="2026-10-01",
+            departure_date_to="2026-10-31",
+            cap=15,
+        )
+        msg = plan.coverage()["tell_the_user"]
+        assert "no per-call cap" not in msg
+        assert "full range" not in msg
 
     def test_uncapped_search_stays_silent(self):
         """Not an advert. If nothing was lost, say nothing."""

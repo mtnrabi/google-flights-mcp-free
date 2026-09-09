@@ -28,6 +28,8 @@ import httpx
 
 from .lambda_client import LambdaError
 
+from .settings import DEFAULT_SOURCE, DEFAULT_TIMEOUT_SECONDS
+
 ENDPOINT_MAP = {
     "search": "/search",
     "hotel_by_name": "/hotel_by_name",
@@ -95,14 +97,29 @@ class HotelsLambdaClient:
         self,
         base_url: str,
         auth_secret: str,
-        timeout_seconds: float = 105.0,
+        # The deployed function's ``Timeout`` plus a transit margin; see
+        # ``settings.DEFAULT_TIMEOUT_SECONDS``. Waiting *less* than the callee's
+        # ``Timeout`` discards answers that were on their way, which is what a
+        # stale 45.0 did after the function was raised to 60 on 2026-08-27.
+        # Overridable per deployment by the settings above.
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         client: httpx.AsyncClient | None = None,
+        # Attribution, sent on every backend call. The Lambda behind these
+        # endpoints also serves RapidAPI Hub traffic from the same function
+        # URL, and until these headers existed the two were indistinguishable
+        # in one shared log group -- so "how many of those calls were ours, and
+        # for which tool" had no answer for any window. Reporting only: the
+        # backend prints them and changes nothing else about the request.
+        source: str = DEFAULT_SOURCE,
+        tool: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._auth_secret = auth_secret
         self._timeout = timeout_seconds
         self._client = client
         self._owns_client = client is None
+        self._source = source or DEFAULT_SOURCE
+        self._tool = tool
 
     async def __aenter__(self) -> "HotelsLambdaClient":
         if self._client is None:
@@ -127,7 +144,10 @@ class HotelsLambdaClient:
         headers = {
             "Content-Type": "application/json",
             "X-RapidAPI-Proxy-Secret": self._auth_secret,
+            "X-FP-Source": self._source,
         }
+        if self._tool:
+            headers["X-FP-Tool"] = self._tool
 
         last_error = "unknown"
         for attempt in range(1, _MAX_ATTEMPTS + 1):

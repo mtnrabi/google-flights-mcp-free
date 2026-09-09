@@ -1,26 +1,38 @@
 # Google Flights MCP — free, ad-supported
 
-Real-time one-way and round-trip flight search for any MCP client. **No API
-key, no account, no billing.** It is funded by one disclosed sponsored card
-attached to each result, not by charging you.
+Real-time one-way and round-trip flight search, and live Booking.com hotel
+rates, for any MCP client. **No API key: sign in with Google and go.** It is
+funded by one disclosed sponsored card attached to each result, not by charging
+you.
 
 ```
 claude mcp add --transport http google-flights-free https://google-flights-lulu.flightpowers.com/mcp
 ```
 
-That is the whole setup. There is no key to paste and nothing to configure.
+Your client hits the URL, gets a `401` with the sign-in details, and shows a
+**Sign in** button. Sign in with Google and the four tools work. That is the
+whole setup: no key, no subscription, nothing else to configure.
+
+Fair use, counted against the account you signed in with: **150 searches a day
+and 2,000 a calendar month.** One call spends one search per date × destination
+combination, so a wide search costs more than one, and a single call is capped
+at 15 combinations. Past either cap the tools answer with `search_status:
+"rate_limited"` and no results.
 
 ---
 
-## The two tools
+## The four tools
 
 | Tool | What it does |
 |---|---|
 | `search_oneway_flights` | One-way search across a date range and a list of destinations |
 | `search_roundtrip_flights` | Round-trip priced as paired legs, across a date range and a `nights` value |
+| `search_hotels` | Live Booking.com availability and nightly prices for a destination and a stay |
+| `find_hotel_by_name` | The same, for one named property |
 
-Both take a **date range** (`departure_date_from` / `departure_date_to`) and a
-**list of destinations**, and expand them server-side. One user intent is one
+The two flight tools take a **date range** (`departure_date_from` /
+`departure_date_to`) and a **list of destinations**, and expand them
+server-side. The two hotel tools take one stay at a time. One user intent is one
 tool call — *"cheapest flight to Sri Lanka anywhere in October"* is a single
 call, not thirty.
 
@@ -78,6 +90,14 @@ Being precise about it, because you should know what you are opting into:
 - The ad is served through [Lulu](https://getlulu.dev). This server does not
   send it your identity — it sends a slot request and renders what comes back.
 
+**What signing in is for.** The allowance above has to belong to somebody, and
+before 2026-09-09 it belonged to a hash of an IP address and a user agent,
+which meant everybody behind one assistant shared one counter and a script that
+changed either got a fresh one. Signing in with Google fixes both ends. What is
+kept is your Google account id and your email address, nothing else: no
+RapidAPI key (there is none to give), no browsing history, no search history
+tied to your name beyond the counters that enforce the caps.
+
 Because ads are involved, this server is **not** listed in the official MCP
 Registry or in the Anthropic and OpenAI directories: all three ban ad-carrying
 servers. That is a deliberate, known consequence of the free model, not an
@@ -96,21 +116,23 @@ paid server below is the better fit and is not restricted this way.
 
 ## When you outgrow the free one
 
-There is a paid, ad-free sibling with the same two tools and the same search
-behind it: **https://google-flights-mcp.flightpowers.com/mcp**
+There is a paid, ad-free sibling with the same four tools and the same search
+behind it: **https://flights.flightpowers.com/mcp** for flights and
+**https://hotels.flightpowers.com/mcp** for hotels.
 
 Nothing here is gated behind it — the free server is fully functional. The
-paid one is simply the right choice once ads, the 15-search cap, or the client
-restriction start getting in your way.
+paid one is simply the right choice once ads, the daily cap, the 15-search
+fan-out cap, or the client restriction start getting in your way.
 
-| | Free — this server | Paid — `google-flights-mcp` |
+| | Free — this server | Paid — `flights` / `hotels` |
 |---|---|---|
 | Ads | one disclosed sponsored card per result | none |
-| API key | none needed | **your own RapidAPI key** |
+| Credential | sign in with Google, no key | sign in with Google **and** your own RapidAPI key, or just the key |
+| Searches | 150 a day, 2,000 a calendar month, per account | whatever your RapidAPI plan holds |
 | Fan-out cap per call | 15 searches | 30 searches (hard max 60; per-call `max_searches` override) |
 | Spend reporting | n/a | `api_usage` on every response |
 | Client restrictions | classified by tier; non-rendering clients may be capped or refused | none — any client, any transport |
-| Listed in the MCP Registry | no (ads are banned there) | yes, as `com.flightpowers/google-flights-mcp` |
+| Listed in the MCP Registry | no (ads are banned there) | yes, as `com.flightpowers/google-flights` and `com.flightpowers/booking` |
 | Cost | free | your own RapidAPI usage |
 
 The trade is straightforward: the paid server has no ads and no restrictions
@@ -125,11 +147,12 @@ RapidAPI — there is a free tier — and copy your `x-rapidapi-key`:
 Then point a client at the paid server:
 
 ```
-claude mcp add --transport http google-flights https://google-flights-mcp.flightpowers.com/mcp --header "x-rapidapi-key: YOUR_RAPIDAPI_KEY"
+claude mcp add --transport http google-flights https://flights.flightpowers.com/mcp --header "x-rapidapi-key: YOUR_RAPIDAPI_KEY"
 ```
 
 The key can also be passed as a `?rapidapi_key=` query parameter, or in a
-client API-key field where the client offers one. Every paid response includes
+client API-key field where the client offers one, or pasted once on the paid
+server's `/connect` page after signing in with Google. Every paid response includes
 `api_usage` with `requests_used_by_this_call`, `plan_requests_remaining`, and
 `plan_requests_limit`, so spend is visible before the next call rather than at
 the end of the month.
@@ -205,13 +228,34 @@ that quotes them, note that the loader strips one layer of surrounding quotes �
 a value pasted with its quotes intact produces a 403 that looks like a wrong
 secret rather than a quoting mistake.
 
-See `example.env` for every variable. The three that matter most:
+See `example.env` for every variable. The ones that matter most:
 
 | Variable | Why it matters |
 |---|---|
 | `MCP_PUBLIC_URL` | **Must exactly match the URL clients connect to.** See below. |
 | `MAX_BACKEND_CALLS_PER_TOOL_CALL` | The cost cap. Default 15. |
 | `ENFORCEMENT_MODE` | `off` / `monitor` / `enforce`. Default `monitor`. |
+| `GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` | Google sign-in. Redirect URI is `<origin>/connect/callback`, scopes `openid` and `.../auth/userinfo.email`. |
+| `DATABASE_URL` | Neon Postgres, **pooled** endpoint. Schema: `migrations/001_free_mcp_signin.sql`. |
+| `FAIR_USE_DAY_CAP` / `FAIR_USE_MONTH_CAP` | The per-account allowance. 150 and 2,000. |
+
+### Sign-in is all-or-nothing, and that is the rollback
+
+The sign-in registers **nothing** unless `GOOGLE_OAUTH_CLIENT_ID`,
+`GOOGLE_OAUTH_CLIENT_SECRET` and `DATABASE_URL` are all set. A deployment
+missing any of them is exactly what this server was before: `/mcp` open to
+anyone, `/mcp/oauth` a 404. `FREE_ANON_MODE=open` is the softer rollback — it
+answers anonymous callers again at `FREE_ANON_DAILY_CAP`, one env var, no
+deploy — and `/mcp/oauth` challenges whatever that says.
+
+Run the migration once per database:
+
+```bash
+psql "$DATABASE_URL" -f migrations/001_free_mcp_signin.sql
+```
+
+Tables are `free_mcp_*` on purpose: a token minted here must never be one the
+paid server would accept.
 
 ### MCP_PUBLIC_URL is a silent failure mode
 

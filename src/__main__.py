@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 
+from .hard_limit import hard_limit_middleware
 from .server import build_server
 from .settings import load_settings
 
@@ -65,7 +66,14 @@ def main() -> None:
         settings.enforcement_mode,
         settings.max_backend_calls_per_tool_call,
     )
-    server.run(transport="http", host=settings.host, port=settings.port)
+    # Same middleware the Vercel entrypoint installs, so `python -m src` and
+    # the deployed server behave identically under a looping caller.
+    server.run(
+        transport="http",
+        host=settings.host,
+        port=settings.port,
+        middleware=list(hard_limit_middleware(server)),
+    )
 
 
 if __name__ == "__main__":

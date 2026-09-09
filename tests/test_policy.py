@@ -104,9 +104,21 @@ class TestDecide:
 
 
 class TestSourceIp:
-    def test_prefers_leftmost_forwarded_for(self):
-        headers = {"x-forwarded-for": "160.79.104.10, 10.0.0.1"}
+    def test_prefers_rightmost_forwarded_for(self):
+        # The edge appends the real client on the right; the left entry is
+        # whatever the inbound request already carried.
+        headers = {"x-forwarded-for": "10.0.0.1, 160.79.104.10"}
         assert extract_source_ip(headers, "10.0.0.1") == "160.79.104.10"
+
+    def test_leftmost_forwarded_for_is_not_trusted(self):
+        # Vercel-shaped header set: a caller types a spoofed leftmost hop
+        # naming an address inside Anthropic's published egress range, and
+        # the edge appends the true client after it. Trusting the leftmost
+        # entry (the old behaviour) would classify the spoofing caller as
+        # TIER_LLM_HOST; trusting the rightmost, edge-appended entry
+        # classifies the true, unprivileged client instead.
+        headers = {"x-forwarded-for": "160.79.104.1, 8.8.8.8"}
+        assert extract_source_ip(headers, "8.8.8.8") == "8.8.8.8"
 
     def test_falls_back_to_real_ip(self):
         assert extract_source_ip({"x-real-ip": "1.2.3.4"}, None) == "1.2.3.4"
@@ -116,6 +128,31 @@ class TestSourceIp:
 
     def test_none_when_nothing_available(self):
         assert extract_source_ip({}, None) is None
+
+
+class TestSourceIpCannotBeSpoofedIntoLlmHost:
+    """A caller who forges the leftmost X-Forwarded-For hop must not land in
+    TIER_LLM_HOST. Regression test for the finding in
+    state/gtm/fair-use-gateway-key-2026-09-05.md: extract_source_ip used to
+    trust the leftmost (caller-supplied) entry, so sending
+    `x-forwarded-for: 160.79.104.1` alone was enough to self-declare into the
+    ad-eligible, full-cap tier.
+    """
+
+    def test_spoofed_leftmost_hop_does_not_classify_as_llm_host(self, classifier):
+        # Vercel-shaped: caller-typed leftmost hop naming an address inside
+        # Anthropic's published range, true client appended by the edge.
+        headers = {"x-forwarded-for": "160.79.104.1, 8.8.8.8"}
+        source_ip = extract_source_ip(headers, "8.8.8.8")
+        assert classifier.classify(source_ip, None) != TIER_LLM_HOST
+
+    def test_real_anthropic_egress_still_classifies_llm_host(self, classifier):
+        # Legitimate Vercel-shaped traffic: the edge appends the real
+        # Anthropic-range address as the rightmost hop. Must still classify
+        # as TIER_LLM_HOST -- this fix must not break real traffic.
+        headers = {"x-forwarded-for": "203.0.113.5, 160.79.104.10"}
+        source_ip = extract_source_ip(headers, "160.79.104.10")
+        assert classifier.classify(source_ip, None) == TIER_LLM_HOST
 
 
 class TestFeedLoadScheduling:

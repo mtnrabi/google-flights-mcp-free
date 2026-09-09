@@ -84,7 +84,7 @@ def ad_server(ads_server, tmp_path, monkeypatch):
 
 
 def _stub_lambda(monkeypatch, rows):
-    async def fake(self, endpoint, payload):
+    async def fake(self, endpoint, payload, **_kwargs):
         return list(rows)
 
     monkeypatch.setattr(lambda_client_module.LambdaClient, "search", fake)
@@ -140,7 +140,7 @@ class TestAdAttachment:
 
     @pytest.mark.asyncio
     async def test_no_ad_when_the_backend_is_down(self, ad_server, monkeypatch):
-        async def always_fail(self, endpoint, payload):
+        async def always_fail(self, endpoint, payload, **_kwargs):
             raise lambda_client_module.LambdaError("502")
 
         monkeypatch.setattr(lambda_client_module.LambdaClient, "search", always_fail)
@@ -359,6 +359,155 @@ class TestResultWidget:
                 f"{tool}: column {column['header']!r} maps to "
                 f"{column['path']!r}, which is not in the response"
             )
+        assert _resolve(mapping["rowLink"], rows[0]) == row["buy_link"], (
+            f"{tool}: rowLink maps to {mapping['rowLink']!r}, which is not "
+            "the booking URL in the response -- every row would be inert"
+        )
+
+    @pytest.mark.parametrize("tool,mapping,row,args", WIDGETS)
+    @pytest.mark.asyncio
+    async def test_row_link_and_its_guard_reach_the_served_widget(
+        self, ad_server, tool, mapping, row, args
+    ):
+        # rowLink lives in the SDK's frame, not in our code, so an SDK that
+        # predates 0.9.1 accepts the mapping key and silently ignores it:
+        # the table still renders, the rows are just dead. Assert on the
+        # served bytes, the same way the beacon is asserted above.
+        html = await _widget_html(ad_server, tool)
+        assert "MAPPING.rowLink" in html, (
+            "widget frame never reads rowLink -- lulu-ads is older than 0.9.1 "
+            "and no row is clickable"
+        )
+        # The mapping travels inside the frame as HTML-escaped JSON.
+        config = html.replace("&quot;", '"')
+        assert f'"rowLink":"{mapping["rowLink"]}"' in config
+        # The click handler is attached only when the path resolves, which is
+        # what makes a link-less row render exactly as it did before.
+        assert "if (rowUrl) tr.addEventListener" in html
+
+    @pytest.mark.parametrize("tool,mapping,row,args", WIDGETS)
+    @pytest.mark.asyncio
+    async def test_a_row_without_a_link_renders(
+        self, ad_server, monkeypatch, tool, mapping, row, args
+    ):
+        # Our own backend fills buy_link on every result, but the MCP server
+        # passes backend rows through verbatim and must not depend on that:
+        # a row with no link has to keep its columns, keep its place in the
+        # table, and -- the part that pays -- keep the ad attached.
+        linkless = {k: v for k, v in row.items() if k != "buy_link"}
+        _stub_lambda(monkeypatch, [linkless])
+        async with Client(ad_server) as client:
+            result = await client.call_tool(tool, args)
+        payload = result.structured_content
+
+        assert payload["result_count"] == 1
+        rows = _resolve(mapping["rows"], payload)
+        assert _resolve(mapping["rowLink"], rows[0]) is None
+        for column in mapping["columns"]:
+            if column is server_module.BOOK_COLUMN:
+                # The one column that is SUPPOSED to be empty here: no URL,
+                # no label, so the cell renders blank rather than offering a
+                # button that opens nothing.
+                assert _resolve(column, rows[0]) is None
+                continue
+            assert _resolve(column, rows[0]) is not None, column["header"]
+        assert payload.get("sponsored") is not None, (
+            "a link-less row must not cost the impression"
+        )
+
+    @pytest.mark.parametrize("tool,mapping,row,args", WIDGETS)
+    @pytest.mark.asyncio
+    async def test_the_book_cell_is_a_label_and_the_url_still_travels(
+        self, ad_server, monkeypatch, tool, mapping, row, args
+    ):
+        """The Book column shows a short label; `buy_link` is untouched.
+
+        table-card writes every cell with `textContent`, so the cell cannot
+        contain an anchor and must not contain the raw URL either -- a Google
+        Flights buy_link is hundreds of characters and would wreck a 400px
+        card. The affordance is the label; the opening is `rowLink`, which
+        already resolves to the same URL.
+        """
+        _stub_lambda(monkeypatch, [row])
+        async with Client(ad_server) as client:
+            result = await client.call_tool(tool, args)
+        rows = result.structured_content["results"]
+
+        assert server_module.BOOK_COLUMN in mapping["columns"], (
+            f"{tool}: no Book column -- the table offers no way to book"
+        )
+        assert _resolve(server_module.BOOK_COLUMN, rows[0]) == "Book →"
+        # Added, not renamed: the URL is where it has always been, and the
+        # row click and the model both still read it from there.
+        assert rows[0]["buy_link"] == row["buy_link"]
+        assert _resolve(mapping["rowLink"], rows[0]) == row["buy_link"]
+
+    @pytest.mark.parametrize("tool,mapping,row,args", WIDGETS)
+    @pytest.mark.asyncio
+    async def test_the_fare_band_rides_the_eyebrow_above_the_table(
+        self, ad_server, monkeypatch, tool, mapping, row, args
+    ):
+        """Google's low|typical|high verdict and range, on the card.
+
+        table-card renders one line above the table and resolves one path for
+        it, so the fare band and the "flights to BUD" line share it. Both
+        halves are asserted: losing the destination would be a regression of
+        what the card said before.
+        """
+        _stub_lambda(monkeypatch, [row])
+        async with Client(ad_server) as client:
+            result = await client.call_tool(tool, args)
+        payload = result.structured_content
+
+        band = payload["fare_band"]
+        assert band.startswith("Google price tracking: ")
+        assert row["price_range_in_relation_to_other_periods"] in band
+        assert str(row["price_insights_low"]) in band
+        assert str(row["price_insights_high"]) in band
+        assert row.get("price", row.get("total_price")) in band
+
+        eyebrow = _resolve(mapping["eyebrow"], payload)
+        assert "BUD" in eyebrow, "the destination line was lost"
+        assert eyebrow.endswith(band), "the fare band never reaches the card"
+
+    @pytest.mark.parametrize("tool,mapping,row,args", WIDGETS)
+    @pytest.mark.asyncio
+    async def test_no_insights_means_no_fare_band_at_all(
+        self, ad_server, monkeypatch, tool, mapping, row, args
+    ):
+        """An absent range prints nothing -- never a half-empty label, never
+        a range inferred from the results we happen to be holding."""
+        bandless = {
+            k: v for k, v in row.items() if not k.startswith("price_insights_")
+        }
+        _stub_lambda(monkeypatch, [bandless])
+        async with Client(ad_server) as client:
+            result = await client.call_tool(tool, args)
+        payload = result.structured_content
+
+        assert "fare_band" not in payload
+        eyebrow = _resolve(mapping["eyebrow"], payload)
+        assert eyebrow and "price tracking" not in eyebrow
+        assert "BUD" in eyebrow
+
+    @pytest.mark.asyncio
+    async def test_the_band_uses_the_currency_the_row_reports(
+        self, ad_server, monkeypatch
+    ):
+        """`price_insights_*` are bare numbers. The symbol comes off the
+        row's own price string, so a caller who asked for euros is not shown
+        a range labelled in dollars."""
+        euro = dict(ONEWAY_ROW, price="€231", price_as_number=231)
+        _stub_lambda(monkeypatch, [euro])
+        async with Client(ad_server) as client:
+            result = await client.call_tool(
+                "search_oneway_flights",
+                {"from_airport": "TLV", "to_airport": "BUD",
+                 "departure_date": "2026-08-14"},
+            )
+        band = result.structured_content["fare_band"]
+        assert "€100" in band and "€210" in band
+        assert "$" not in band
 
     @pytest.mark.asyncio
     async def test_no_result_widgets_when_ads_are_disabled(

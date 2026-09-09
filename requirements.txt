@@ -1,7 +1,54 @@
-fastmcp>=3.0.0
-lulu-ads==0.8.5
+# CAPPED BELOW 4. fastmcp 4.0.0 (2026-08-31) moved `ToolResult` out of
+# `fastmcp.tools.tool` and into `fastmcp.tools`, and src/server.py imports it
+# from the old path. The floor alone was not a constraint: every build after
+# 08-31 resolved to 4.0.x, the import raised at module load, and the function
+# answered FUNCTION_INVOCATION_FAILED on every route -- a build that Vercel
+# still marks Ready, so the failure only shows up in production traffic.
+# Verified live on mcp_server_lulu on 2026-09-02 and rolled back.
+#
+# The cap is what makes this file describe the runtime that the suite actually
+# runs against (3.4.7). To move to 4.x, change the import to
+# `from fastmcp.tools import ToolResult` (present in 3.x too), re-run the
+# suite, and raise the cap in the same commit.
+fastmcp>=3.0.0,<4
+# PINNED EXACTLY, DELIBERATELY. This SDK's failure modes do not raise -- they
+# no-op and CPM silently goes to zero, so a bad version shows up on a revenue
+# chart rather than in a stack trace, and a floor would let one land on an
+# unattended Vercel redeploy. 0.9.10 is the version the suite is verified
+# against. `rowLink` (what makes each row click through to its buy_link)
+# arrived in 0.9.1; 0.9.2 fixed a middleware early-return that left CLI hosts
+# with no visible ad at all. 0.9.5-0.9.10 (checked 2026-09-06, diffed against
+# 0.9.4) only ADD: a CLI delivery beacon (client.py/middleware.py, fired via
+# asyncio.create_task inside the existing async request path, never
+# asyncio.run -- best-effort, non-blocking) and new opt-in `template=`
+# formats on lulu_ads.widget.register_sponsored_widget (banner/hero/flip-card/
+# etc, default stays "card"). We don't pass `template=` or `background_image=`
+# at our one call site (src/server.py), so behaviour there is unchanged.
+# `lulu_ads/widgets.py` -- FRAME_HTML, result_widget_html, the rowLink guard
+# our _register_result_widget depends on -- is BYTE-IDENTICAL between 0.9.4
+# and 0.9.10 (md5 match); none of the above touches it.
+#
+# To upgrade: diff the new wheel's `lulu_ads/widgets.py` FRAME_HTML against
+# this version's, then re-run tests/test_ads.py -- specifically
+# test_row_link_and_its_guard_reach_the_served_widget, which asserts on the
+# served widget bytes. That test fails on 0.8.5 and passes on 0.9.2+, so it
+# genuinely detects an SDK that accepts the `rowLink` mapping key and never
+# reads it. Bumping without both steps is how the CPM goes quiet.
+lulu-ads==0.9.10
 httpx>=0.27.0
-# Only used by the Vercel entrypoint (api/index.py), to hand FastMCP's
-# lifespan to the host. Without lifespan the MCP session manager never
-# starts and every /mcp request 500s.
+# KEPT ON PURPOSE THOUGH NOTHING IMPORTS IT. Vercel picks the Python
+# framework preset from the dependency list, and a project that resolves to
+# `framework: null` 404s every route -- so removing this line does not save a
+# millisecond of runtime and can take the deployment down.
+#
+# api/index.py used to import it, to hand FastMCP's lifespan to the host.
+# That wrapper is now Starlette (already a FastMCP dependency), because
+# importing FastAPI costs ~110 ms of CPU on every cold start and this app
+# serves no OpenAPI schema. The wrapper itself is still load-bearing: without
+# a lifespan the MCP session manager never starts and every /mcp request
+# 500s. See api/index.py and tests/test_entrypoint.py.
 fastapi>=0.115.0
+# Imported directly by src/server.py for `Field(description=...)` on
+# use_fallback. Already a hard dependency of both fastmcp and fastapi;
+# declared here because it is now imported by our own code.
+pydantic>=2
