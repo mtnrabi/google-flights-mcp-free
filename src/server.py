@@ -46,7 +46,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_context, get_http_request
 from fastmcp.tools.tool import ToolResult
-from mcp.types import TextContent
+from mcp.types import TextContent, ToolAnnotations
 from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -60,7 +60,7 @@ from .status_text import (
     partial_first_line,
     serialize_payload,
 )
-from .oauth import ANON_MODE_OPEN, anon_mode, build_free_oauth
+from .oauth import ANON_MODE_OPEN, anon_caps, anon_mode, build_free_oauth
 from .oauthroutes import register_oauth_routes
 from .fair_use import (
     SIGNED_IN_HEADER,
@@ -73,6 +73,7 @@ from .fair_use import (
     FairUseState,
     caps_for as fair_use_caps_for,
     fair_use_note,
+    usage_note as fair_use_usage_note,
     identify as fair_use_identify,
     log_line as fair_use_log_line,
     rate_limited_result,
@@ -1608,14 +1609,18 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         # every stdio user on the strength of nothing.
         fair_use: FairUseState | None = None
         if identity:
+            # `anon_caps`, not `settings.anon_day_cap`: the taster tier only
+            # exists under the FREE_ANON_MODE=open rollback, and a cap nobody
+            # can reach must not shape the numbers a caller is shown.
+            anon_day, anon_month = anon_caps(settings)
             day_cap, month_cap = fair_use_caps_for(
                 identity.kind,
                 day_cap=settings.fair_use_day_cap,
                 month_cap=settings.fair_use_month_cap,
                 gateway_day_cap=settings.fair_use_gateway_day_cap,
                 gateway_month_cap=settings.fair_use_gateway_month_cap,
-                anon_day_cap=settings.anon_day_cap,
-                anon_month_cap=settings.anon_month_cap,
+                anon_day_cap=anon_day,
+                anon_month_cap=anon_month,
             )
             used_today, used_month = await telemetry.fair_use_usage(identity.key)
             fair_use = FairUseState(
@@ -1817,13 +1822,22 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                 f"{response['partial']} {note}" if "partial" in response else note
             )
 
-        # The fair-use warning. Attached from 80% of either cap onwards, with
-        # this call's own spend already counted, so the number the caller is
-        # shown is where they stand now and not where they stood a moment ago.
+        # The fair-use block. On EVERY successful result since 2026-09-09,
+        # not only past 80%: a signed-in user's first 119 searches used to
+        # carry no number at all, so nobody -- neither the person nor the
+        # model deciding whether to mention the paid server -- could see
+        # where they stood until the allowance was nearly gone. The compact
+        # receipt (`usage_note`) is the default; from 80% of either cap it is
+        # replaced by the richer warning, which brings the directions and the
+        # `upgrade` object with it. This call's own spend is already counted
+        # either way, so the number is where they stand now and not where
+        # they stood a moment ago.
         if fair_use is not None:
             spent = fair_use.after(outcome.backend_calls_made)
+            who = identity.email if identity else ""
+            response["fair_use"] = fair_use_usage_note(spent, who)
             if spent.warning:
-                response["fair_use"] = fair_use_note(spent)
+                response["fair_use"] = fair_use_note(spent, who)
                 # Same object a refusal carries: a warning that points at an
                 # upgrade path which is not actually in the result is just a
                 # sentence the model cannot act on.
@@ -1924,6 +1938,21 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         name="search_oneway_flights",
         # Declared, not inferred: see src/output_schema.py.
         output_schema=FLIGHTS_OUTPUT_SCHEMA,
+        # Required by Anthropic's directory review and a listed rejection
+        # reason at OpenAI: a tool with no annotations is read as potentially
+        # destructive. All four tools here only read -- none can book, hold,
+        # pay for or cancel anything -- and all four reach a live third-party
+        # API whose result set is not a closed domain, hence openWorldHint.
+        # NOT idempotent: fares and room rates change between identical calls,
+        # and a host that cached one would serve a stale price as a live one.
+        title="FlightPowers free: search one-way flights",
+        annotations=ToolAnnotations(
+            title="FlightPowers free: search one-way flights",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
         description=described(
                 "FlightPowers one-way fare search: live prices read from "
                 "Google Flights, not schedules.\n\n"
@@ -2063,6 +2092,14 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         name="search_roundtrip_flights",
         # Declared, not inferred: see src/output_schema.py.
         output_schema=FLIGHTS_OUTPUT_SCHEMA,
+        title="FlightPowers free: search round-trip flights",
+        annotations=ToolAnnotations(
+            title="FlightPowers free: search round-trip flights",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
         description=described(
                 "FlightPowers round-trip fare search: live prices read from "
                 "Google Flights, priced as paired legs rather than two "
@@ -2264,14 +2301,15 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             # to keep searching on a key of their own.
             fair_use: FairUseState | None = None
             if identity:
+                anon_day, anon_month = anon_caps(settings)
                 day_cap, month_cap = fair_use_caps_for(
                     identity.kind,
                     day_cap=settings.fair_use_day_cap,
                     month_cap=settings.fair_use_month_cap,
                     gateway_day_cap=settings.fair_use_gateway_day_cap,
                     gateway_month_cap=settings.fair_use_gateway_month_cap,
-                    anon_day_cap=settings.anon_day_cap,
-                    anon_month_cap=settings.anon_month_cap,
+                    anon_day_cap=anon_day,
+                    anon_month_cap=anon_month,
                 )
                 used_today, used_month = await telemetry.fair_use_usage(
                     identity.key
@@ -2374,11 +2412,15 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                 )
             response["upgrade"] = upgrade_note("hotels")
 
-            # One hotel search is one backend call, so `spent` is 1.
+            # One hotel search is one backend call, so `spent` is 1. The
+            # block rides on every success; the warning shape replaces it
+            # from 80% of either cap. See the flights path for why.
             if fair_use is not None:
                 spent = fair_use.after(1)
+                who = identity.email if identity else ""
+                response["fair_use"] = fair_use_usage_note(spent, who)
                 if spent.warning:
-                    response["fair_use"] = fair_use_note(spent)
+                    response["fair_use"] = fair_use_note(spent, who)
                     # Overrides the generic ad-tier `upgrade_note` set above:
                     # once the cap is the live issue, the specific fair-use
                     # path is more useful than the general one.
@@ -2424,6 +2466,14 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             name="search_hotels",
             # Declared, not inferred: see src/output_schema.py.
             output_schema=HOTELS_OUTPUT_SCHEMA,
+            title="FlightPowers free: search hotels",
+            annotations=ToolAnnotations(
+                title="FlightPowers free: search hotels",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
             description=described(
                     "FlightPowers hotel search: live Booking.com availability "
                     "and nightly prices for a "
@@ -2498,6 +2548,14 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             name="find_hotel_by_name",
             # Declared, not inferred: see src/output_schema.py.
             output_schema=HOTELS_OUTPUT_SCHEMA,
+            title="FlightPowers free: find one hotel by name",
+            annotations=ToolAnnotations(
+                title="FlightPowers free: find one hotel by name",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
             description=described(
                     "FlightPowers single-property lookup: live Booking.com "
                     "availability and pricing for one named property. Input: "
@@ -2583,18 +2641,61 @@ def build_server(settings: Settings | None = None) -> FastMCP:
     # ── operational routes ───────────────────────────────────────────────
 
     @mcp.custom_route("/health", methods=["GET"])
-    async def health(_request: Request) -> JSONResponse:
-        return JSONResponse(
-            {
-                "status": "ok",
-                "service": "flight-powers-free",
-                # The two facts a deploy has to be able to check without a
-                # browser: is sign-in wired at all, and which URL do we tell
-                # people to use.
-                "signin_enabled": oauth is not None,
-                "signin_endpoint": (oauth.resource_url if oauth else None),
-            }
-        )
+    async def health(request: Request) -> JSONResponse:
+        """Is this deployment actually able to sign anyone in?
+
+        It used to answer `{"status": "ok", "signin_enabled": true}` by
+        reading configuration, and on 2026-09-09 it said exactly that for 25
+        minutes while every `/oauth/register` answered 503 -- the image had
+        shipped without `asyncpg`, so both sign-in stores were unreachable
+        and, since sign-in is now the only way into `/mcp`, no MCP client
+        could use the server at all. A monitor watching this endpoint saw
+        nothing. So health now PROBES rather than reports: one `SELECT 1`
+        against each store, concurrently, under a short timeout.
+
+        `signin_store` is the single word to alert on: `ok`, `unreachable`,
+        or `not_configured` on a deployment that has no sign-in at all.
+        `status` degrades with it, because a green status line next to a
+        broken product is what made the last outage invisible.
+
+        `?stores=0` skips the probes for a caller that wants the cheap
+        liveness answer (a load balancer, a cold-start check) and does not
+        want two database connections on every poll.
+        """
+        body: dict[str, Any] = {
+            "status": "ok",
+            "service": "flight-powers-free",
+            # The facts a deploy has to be able to check without a browser:
+            # is sign-in wired at all, which URL do we tell people to use,
+            # and -- since it is an env var whose whole purpose is to be
+            # flipped in an incident -- which anonymous mode is this RUNNING
+            # deployment in. On Vercel a variable added in the dashboard
+            # reaches only the NEXT deployment, so "I set FREE_ANON_MODE" and
+            # "the server has FREE_ANON_MODE" are different claims, and this
+            # is the one that settles which.
+            "signin_enabled": oauth is not None,
+            "signin_endpoint": (oauth.resource_url if oauth else None),
+            "anon_mode": anon_mode(),
+        }
+        if oauth is None:
+            body["signin_store"] = "not_configured"
+            return JSONResponse(body)
+        if request.query_params.get("stores", "1").lower() in ("0", "no", "false"):
+            return JSONResponse(body)
+
+        stores = await oauth.store_health()
+        body["stores"] = stores
+        states = set(stores.values())
+        if "unreachable" in states:
+            body["signin_store"] = "unreachable"
+            body["status"] = "degraded"
+        elif states == {"ok"}:
+            body["signin_store"] = "ok"
+        else:
+            # not_configured / unknown: nothing is broken, but nothing was
+            # proved either. Never report "ok" for a probe that did not run.
+            body["signin_store"] = sorted(states)[0]
+        return JSONResponse(body)
 
     @mcp.custom_route("/metrics", methods=["GET"])
     async def metrics(request: Request) -> JSONResponse:
@@ -2614,6 +2715,10 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             "openai_ranges_loaded": classifier.openai_ranges_loaded,
             "openai_ranges_error": classifier.openai_ranges_error,
             "public_url": settings.public_url,
+            # The running deployment's rollback switch, read from the
+            # environment on this request. See /health for why it matters.
+            "anon_mode": anon_mode(),
+            "anon_day_cap": anon_caps(settings)[0],
         }
         return JSONResponse(snapshot)
 

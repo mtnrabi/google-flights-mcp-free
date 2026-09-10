@@ -508,7 +508,25 @@ def wired(monkeypatch):
     return server, app
 
 
-async def _post(app, path, headers, peer="198.51.100.7"):
+#: What a caller sends when they want something that costs a backend search.
+#: The probe of choice for "is this challenged": a `tools/list` is read-only
+#: discovery and is served to anybody (src/discovery.py).
+A_SEARCH = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+        "name": "search_oneway_flights",
+        "arguments": {
+            "from_airport": "TLV",
+            "to_airport": "FCO",
+            "departure_date": "2026-10-14",
+        },
+    },
+}
+
+
+async def _post(app, path, headers, peer="198.51.100.7", message=None):
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app, client=(peer, 5000))
         async with httpx.AsyncClient(
@@ -516,13 +534,24 @@ async def _post(app, path, headers, peer="198.51.100.7"):
         ) as client:
             return await client.post(
                 path,
-                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                json=message or {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                 headers={
                     **headers,
                     "content-type": "application/json",
                     "accept": "application/json, text/event-stream",
                 },
             )
+
+
+def _rpc_result(response):
+    """The JSON-RPC `result`, whether the transport answered JSON or SSE."""
+    text = response.text.strip()
+    if text.startswith("{"):
+        return json.loads(text)["result"]
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            return json.loads(line[len("data:") :].strip())["result"]
+    raise AssertionError(f"no JSON-RPC payload in {text!r}")
 
 
 async def _get(app, path, base_url="http://testserver"):
@@ -534,6 +563,11 @@ async def _get(app, path, base_url="http://testserver"):
             return await client.get(path)
 
 
+def server_oauth(app):
+    """The OAuthSupport behind the mounted gate."""
+    return app.routes[-1].app.support
+
+
 class TestOverTheWire:
     @pytest.mark.asyncio
     async def test_the_metadata_is_served_for_both_paths(self, wired):
@@ -541,9 +575,20 @@ class TestOverTheWire:
         for suffix in ("", MCP_PATH, MCP_OAUTH_PATH):
             got = await _get(app, f"/.well-known/oauth-protected-resource{suffix}")
             assert got.status_code == 200, suffix
-            # ONE resource identifier however you discovered it. A token
-            # audience that changed with the path would fail on the other.
-            assert got.json()["resource"].endswith(MCP_PATH)
+            # RFC 9728 3.3: the document names the resource that was asked
+            # about. A client challenged on the alias fetches the
+            # `/mcp/oauth` document and compares the two literally, so that
+            # one has to say `/mcp/oauth`; the bare well-known path and the
+            # `/mcp` one say `/mcp`.
+            assert got.json()["resource"].endswith(suffix or MCP_PATH), suffix
+        # Still ONE audience: every one of those names is accepted for a
+        # token, so discovery on either path yields a token that works on
+        # both.
+        for suffix in ("", MCP_PATH, MCP_OAUTH_PATH):
+            named = (
+                await _get(app, f"/.well-known/oauth-protected-resource{suffix}")
+            ).json()["resource"]
+            assert server_oauth(app).resource_matches(named), named
         body = (await _get(app, "/.well-known/oauth-authorization-server")).json()
         assert body["authorization_endpoint"].endswith("/connect/authorize")
         assert body["code_challenge_methods_supported"] == ["S256"]
@@ -551,8 +596,10 @@ class TestOverTheWire:
 
     @pytest.mark.asyncio
     async def test_a_direct_caller_with_no_credential_is_challenged(self, wired):
+        """On the call that would spend something. The handshake in front of
+        it is served to anybody -- `TestDiscoveryWithoutCredentials`."""
         _, app = wired
-        response = await _post(app, MCP_PATH, DIRECT_HEADERS)
+        response = await _post(app, MCP_PATH, DIRECT_HEADERS, message=A_SEARCH)
         assert response.status_code == 401
         assert "resource_metadata=" in response.headers["www-authenticate"]
         assert "Sign in with Google" in response.json()["error"]["message"]
@@ -565,17 +612,99 @@ class TestOverTheWire:
         do MCP authorization stops working until it can."""
         _, app = wired
         response = await _post(
-            app, MCP_PATH, POOLED_HEADERS, peer="160.79.104.7"
+            app, MCP_PATH, POOLED_HEADERS, peer="160.79.104.7", message=A_SEARCH
         )
         assert response.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_health_reports_whether_sign_in_is_wired(self, wired):
+    async def test_a_scanner_with_no_credentials_sees_the_whole_menu(self, wired):
+        """Glama re-checks every connector HOURLY by opening an MCP
+        connection and listing its tools, with no credentials, and marks the
+        listing unhealthy on a 401 -- which is what happened to us on
+        2026-09-09 (its mail to Matan that evening). Smithery's release scan,
+        mcpservers.org and M8ven probe the same way.
+
+        Not just a 200: the reviewable schema. A directory that gets tools
+        with no `title` and no annotations ranks the listing down for a
+        different reason (Anthropic Directory Policy 5.E).
+        """
         _, app = wired
-        body = (await _get(app, "/health")).json()
+        response = await _post(app, MCP_PATH, DIRECT_HEADERS)
+        assert response.status_code == 200, response.text
+        assert "www-authenticate" not in response.headers
+        tools = _rpc_result(response)["tools"]
+        assert {t["name"] for t in tools} >= {
+            "search_oneway_flights",
+            "search_roundtrip_flights",
+        }
+        for tool in tools:
+            assert tool.get("title"), tool["name"]
+            annotations = tool.get("annotations") or {}
+            assert annotations.get("title"), tool["name"]
+            assert annotations.get("readOnlyHint") is True, tool["name"]
+            # A live fare is never idempotent: a host that cached one would
+            # quote a stale price to somebody about to book.
+            assert annotations.get("idempotentHint") is not True, tool["name"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method",
+        [
+            "initialize",
+            "notifications/initialized",
+            "ping",
+            "prompts/list",
+            "resources/list",
+            "resources/templates/list",
+        ],
+    )
+    async def test_the_rest_of_the_read_only_handshake_is_served(self, wired, method):
+        _, app = wired
+        response = await _post(
+            app,
+            MCP_PATH,
+            DIRECT_HEADERS,
+            message={"jsonrpc": "2.0", "id": 1, "method": method},
+        )
+        assert response.status_code in (200, 202), response.text
+
+    @pytest.mark.asyncio
+    async def test_a_batch_hiding_a_tool_call_is_challenged(self, wired):
+        """A batch is one HTTP response, so it is served whole or refused
+        whole -- and a `tools/call` behind a `tools/list` must not be the way
+        through."""
+        _, app = wired
+        response = await _post(
+            app,
+            MCP_PATH,
+            DIRECT_HEADERS,
+            message=[{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, A_SEARCH],
+        )
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_the_alias_challenges_discovery_too(self, wired):
+        """`/mcp/oauth` is for a client whose auth mode is fixed when the
+        server is ADDED, and for a directory that wants a server which always
+        requires auth. The opening does not apply there."""
+        _, app = wired
+        response = await _post(app, MCP_OAUTH_PATH, DIRECT_HEADERS)
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_health_reports_whether_sign_in_is_wired(self, wired):
+        """The cheap form: configuration only, no store probe.
+
+        `?stores=0` is what a liveness check uses. The probing form is
+        `TestHealthProbesTheStores` in tests/test_free_followups.py, which is
+        also where the 2026-09-09 "green while sign-in is dead" case lives.
+        """
+        _, app = wired
+        body = (await _get(app, "/health?stores=0")).json()
         assert body["status"] == "ok"
         assert body["signin_enabled"] is True
         assert body["signin_endpoint"].endswith(MCP_PATH)
+        assert body["anon_mode"] == "challenge"
 
     @pytest.mark.asyncio
     async def test_the_connect_page_states_the_email_before_the_button(self, wired):

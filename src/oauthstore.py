@@ -186,6 +186,8 @@ class TokenRecord:
 class OAuthStore(Protocol):
     available: bool
 
+    async def ping(self, timeout: float = 0.0) -> bool: ...
+
     async def register_client(self, client: OAuthClient) -> None: ...
 
     async def get_client(self, client_id: str) -> OAuthClient | None: ...
@@ -233,6 +235,11 @@ class NullOAuthStore:
     """
 
     available = False
+
+    async def ping(self, timeout: float = 0.0) -> bool:
+        """Nothing to reach. `available` is False, so `/health` reports this
+        as "not configured" rather than as an outage."""
+        return False
 
     async def register_client(self, client: OAuthClient) -> None:
         raise OAuthStoreError("no OAuth store configured (DATABASE_URL)")
@@ -293,6 +300,9 @@ class MemoryOAuthStore:
     """
 
     available = True
+
+    async def ping(self, timeout: float = 0.0) -> bool:
+        return True
 
     def __init__(self) -> None:
         self._clients: dict[str, OAuthClient] = {}
@@ -546,6 +556,29 @@ class PostgresOAuthStore:
             raise OAuthStoreError(f"OAuth store operation failed: {exc}") from exc
         finally:
             await conn.close()
+
+    async def ping(self, timeout: float = 0.0) -> bool:
+        """One `SELECT 1`. Raises `OAuthStoreError` if the store is unreachable.
+
+        This is the check `/health` runs, and it is deliberately the cheapest
+        statement there is: what it proves is that the driver imports, the
+        DSN parses, the host answers and the credentials are accepted -- the
+        four ways this store was broken on 2026-09-09, when `requirements.txt`
+        was missing `asyncpg`, every `/oauth/register` answered 503 for
+        25 minutes, and `/health` said `ok` throughout because it never
+        touched the store.
+
+        `timeout` overrides the connect timeout for this call only: a health
+        check must answer a monitor quickly, and waiting the full 8 s of a
+        real operation would turn a slow store into a timed-out probe.
+        """
+        limit = timeout if timeout and timeout > 0 else self._connect_timeout
+        original, self._connect_timeout = self._connect_timeout, limit
+        try:
+            await self._run(lambda conn: conn.fetchval("SELECT 1"))
+        finally:
+            self._connect_timeout = original
+        return True
 
     # ── clients ──────────────────────────────────────────────────────────
 

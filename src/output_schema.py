@@ -301,9 +301,11 @@ FLIGHTS_OUTPUT_SCHEMA: dict[str, Any] = {
             "type": "object",
             "description": (
                 "This client's standing against the free server's per-client "
-                "caps. Present from 80% of either cap onwards, and on every "
-                "rate_limited result. Counts BACKEND searches, so one call "
-                "over a date range can move it by more than one."
+                "caps. Present on EVERY successful result, on every "
+                "rate_limited result, and in a richer form (with `note` and "
+                "an `upgrade` object beside it) from 80% of either cap "
+                "onwards. Counts BACKEND searches, so one call over a date "
+                "range can move it by more than one."
             ),
             "properties": {
                 "used_today": {"type": "integer", "minimum": 0},
@@ -319,6 +321,14 @@ FLIGHTS_OUTPUT_SCHEMA: dict[str, Any] = {
                     ),
                 },
                 "note": {"type": "string"},
+                "signed_in": {"type": "boolean"},
+                "user": {
+                    "type": "string",
+                    "description": (
+                        "The signed-in account this allowance belongs to. "
+                        "Absent for a caller who is not signed in."
+                    ),
+                },
             },
             "additionalProperties": True,
         },
@@ -392,9 +402,11 @@ HOTELS_OUTPUT_SCHEMA: dict[str, Any] = {
             "type": "object",
             "description": (
                 "This client's standing against the free server's per-client "
-                "caps. Present from 80% of either cap onwards, and on every "
-                "rate_limited result. Counts BACKEND searches, so one call "
-                "over a date range can move it by more than one."
+                "caps. Present on EVERY successful result, on every "
+                "rate_limited result, and in a richer form (with `note` and "
+                "an `upgrade` object beside it) from 80% of either cap "
+                "onwards. Counts BACKEND searches, so one call over a date "
+                "range can move it by more than one."
             ),
             "properties": {
                 "used_today": {"type": "integer", "minimum": 0},
@@ -410,6 +422,14 @@ HOTELS_OUTPUT_SCHEMA: dict[str, Any] = {
                     ),
                 },
                 "note": {"type": "string"},
+                "signed_in": {"type": "boolean"},
+                "user": {
+                    "type": "string",
+                    "description": (
+                        "The signed-in account this allowance belongs to. "
+                        "Absent for a caller who is not signed in."
+                    ),
+                },
             },
             "additionalProperties": True,
         },

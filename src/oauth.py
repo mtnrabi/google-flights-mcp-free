@@ -30,25 +30,34 @@ What is different from the paid copy
 * **The consent page states the email.** Signing in puts the address on
   FlightPowers product updates, with an unsubscribe link, and the page says
   so in one sentence before the button rather than in a policy nobody opens.
-* **`/mcp` is untouched, and stays untouched.** Same open access, same caps,
-  same sponsored card. The free pilot's terms are frozen through 2026-09-20,
-  so this whole feature is additive: a new endpoint, and one extra line in
-  the `upgrade` object that anonymous callers already receive.
-* **Phase 2 is a config flip, not a code change.** `FREE_ANON_DAILY_CAP` /
-  `FREE_ANON_MONTHLY_CAP` (in settings.py) and `FREE_ANON_MODE` (below) are
-  the levers; both default to today's behaviour exactly.
+* **`/mcp` requires the sign-in too, since 2026-09-09** (Matan: "for free
+  MCP - let's make all of them go through oauth in the plain /mcp"). Same
+  tools, same sponsored card, same caps -- but a credential-less call is
+  answered 401 plus the challenge, so every served call belongs to a Google
+  account. There is no unauthenticated endpoint and no "open endpoint": if a
+  sentence anywhere promises one, it is a leftover and it is wrong.
+* **The rollback is a config flip, not a code change** -- but it is NOT
+  "one env var, no deploy". `FREE_ANON_MODE=open` plus a redeploy, and
+  `FREE_ANON_DAILY_CAP` / `FREE_ANON_MONTHLY_CAP` (settings.py) are what an
+  anonymous caller then gets. See the FREE_ANON_MODE block below for the two
+  ways that flip silently does nothing.
 
 The endpoints
 -------------
 A client only ever STARTS an OAuth flow when a request is answered `401` with
 `WWW-Authenticate: Bearer resource_metadata=...`. So:
 
-    /mcp        unchanged. Anonymous, ad-supported, capped per client key.
-                No 401 -- unless FREE_ANON_MODE=challenge is set later, and
-                even then never for a gateway or config-blob caller.
-    /mcp/oauth  the same tools, the same sponsored card, the same caps, but
-                Bearer-only: no token means 401 + the challenge header, which
-                is the signal that makes a client show a Sign in button.
+    /mcp        the URL we publish. Bearer-only for anything that spends,
+                since 2026-09-09: no token means 401 + the challenge header,
+                which is the signal that makes a client show a Sign in
+                button. Nobody is exempt, gateways included. Read-only
+                discovery (`initialize`, `tools/list` and friends) is served
+                without a token -- src/discovery.py, and the directory health
+                checks that made it necessary. `FREE_ANON_MODE=open` is the
+                rollback for the rest.
+    /mcp/oauth  the same handler under the name printed in older guides, so
+                nobody has to re-add a server. Always challenges, in either
+                mode, discovery included.
 
 The flow, end to end
 --------------------
@@ -97,6 +106,7 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 from . import cimd
+from .discovery import discovery_probe
 from .oauthstore import (
     AuthCode,
     OAuthClient,
@@ -118,16 +128,15 @@ logger = logging.getLogger(__name__)
 
 # ── the shape of the deployment ──────────────────────────────────────────
 
-#: The ALIAS with always-challenge semantics. `/mcp` is the URL we market
-#: (Matan, 2026-09-09: "do we really need the path to end in /oauth?"), and
-#: it behaves the way the MCP spec calls "authorization required when the
-#: server asks": anonymous callers are served under the taster cap and are
-#: challenged at the cap. This path exists for the clients that cannot do
-#: that -- ChatGPT connectors and Claude's own connector UI fix the auth mode
-#: when the server is ADDED, so a 401 arriving later in the session is a
-#: failure rather than a prompt -- and for anyone who wants sign-in with no
-#: ambiguity at all. Same handler, same tools, same everything; the only
-#: difference is that request one is challenged instead of request eleven.
+#: The ALIAS. `/mcp` is the URL we market (Matan, 2026-09-09: "do we really
+#: need the path to end in /oauth?") and it challenges on request one, so in
+#: the shipped configuration this path behaves identically. It exists for two
+#: reasons: it is printed in older guides and saved in connectors added
+#: before 2026-09-09, and it keeps challenging even under the
+#: `FREE_ANON_MODE=open` rollback -- ChatGPT connectors and Claude's own
+#: connector UI fix the auth mode when the server is ADDED, so a client that
+#: needs a 401 on request one has a URL that always gives it one. Same
+#: handler, same tools, same registry, same sponsored card.
 MCP_OAUTH_PATH = "/mcp/oauth"
 #: What the gate rewrites the path to before handing the request on. FastMCP
 #: mounts a plain `Route("/mcp")`, not a Mount, so `/mcp/oauth` reaches
@@ -163,9 +172,36 @@ TERMS_URL = PAGES_TERMS_URL
 #:   open       the ROLLBACK, and nothing else. `/mcp` answers a
 #:              credential-less caller under the anonymous taster cap
 #:              (`FREE_ANON_DAILY_CAP`, enforced by
-#:              `anon_gate.AnonCapMiddleware`), which is what the server did
-#:              before this change. One env var, no deploy, if requiring
-#:              sign-in turns out to cost more traffic than it converts.
+#:              `anon_gate.AnonCapMiddleware`), for when requiring sign-in
+#:              turns out to cost more traffic than it converts.
+#:
+#: HOW TO ACTUALLY FLIP IT (learned the hard way, 2026-09-09 18:1xZ)
+#: -----------------------------------------------------------------
+#: This used to say "one env var, no deploy". That is wrong on Vercel and it
+#: cost an incident. Two things have to be true, and neither is automatic:
+#:
+#:   1. **Set the variable AND redeploy.** A Vercel environment variable is
+#:      baked into a deployment; adding one in the dashboard does nothing to
+#:      the function that is already running. `vercel redeploy <prod-url>`
+#:      re-reads project env and keeps the target. Confirm the running code
+#:      actually has it: `GET /health` reports `anon_mode`, which is read
+#:      from the environment on that request. If it still says `challenge`,
+#:      the deployment never saw the variable and no amount of curling `/mcp`
+#:      will tell you that.
+#:   2. **Remember what the taster cap is counted against.** `open` does not
+#:      restore the pre-2026-09-09 allowance; it grants `FREE_ANON_DAILY_CAP`
+#:      (10 by default) against the SAME per-day counter those callers had
+#:      been spending at 150. A caller who already used more than 10 today is
+#:      refused the moment the switch lands, which looks exactly like "the
+#:      switch did nothing". To restore service rather than offer a taster,
+#:      set `FREE_ANON_DAILY_CAP` to the ordinary day cap in the same
+#:      redeploy, or wait for 00:00 UTC.
+#:
+#: `initialize` and `tools/list` are never refused, by the cap or by the
+#: sign-in gate, in either mode (`anon_gate` reads the JSON-RPC method for
+#: the cap; `discovery.py` does it for the challenge), so a client can always
+#: connect and discover the tools, and the refusal arrives on the call that
+#: would spend something.
 #:
 #: Nobody is exempt in `challenge`, gateways included. Smithery's release
 #: probe arrives with no credential, sees the 401, and flips its listing into
@@ -188,6 +224,28 @@ def anon_mode() -> str:
     """
     raw = (os.environ.get("FREE_ANON_MODE") or "").strip().lower()
     return ANON_MODE_OPEN if raw == ANON_MODE_OPEN else ANON_MODE_CHALLENGE
+
+
+def anon_caps(settings: Any) -> tuple[int, int]:
+    """The anonymous (day, month) caps that actually apply right now.
+
+    ONE place decides this, because it is read in four: the ASGI cap gate,
+    both tool layers, and the account page that prints "a caller with no
+    account gets N a day". Before this function they each read
+    `settings.anon_day_cap` directly, so in `challenge` mode -- where nothing
+    is served anonymously at all -- the account page still promised an
+    anonymous allowance and the tool layer still carried its number. A cap
+    that cannot be reached is not a cap; it is a sentence that is wrong.
+
+    `(0, 0)` in `challenge` mode means "no anonymous tier", which is what
+    `fair_use.caps_for` already reads as "fall back to the ordinary caps".
+    """
+    if anon_mode() != ANON_MODE_OPEN:
+        return 0, 0
+    return (
+        int(getattr(settings, "anon_day_cap", 0) or 0),
+        int(getattr(settings, "anon_month_cap", 0) or 0),
+    )
 
 
 #: One scope. A second one would be a promise that some tokens can do less
@@ -464,6 +522,53 @@ class OAuthSupport:
     def csrf_ok(self, sub: str, given: str) -> bool:
         return bool(given) and hmac.compare_digest(self.csrf(sub), given)
 
+    # ── is the sign-in actually working? ─────────────────────────────────
+
+    async def store_health(self, timeout: float = 2.5) -> dict[str, str]:
+        """Probe both sign-in stores. `{"oauth": "ok", "free_users": "ok"}`.
+
+        WHY THIS EXISTS. On 2026-09-09 the free server shipped without
+        `asyncpg` in `requirements.txt`. Every `/oauth/register` and every
+        `/connect/authorize` answered 503 "the registration store is not
+        reachable", so no MCP client could sign in and -- because sign-in is
+        now the only way in -- no MCP client could call the server at all,
+        for 25 minutes. `/health` answered `{"status": "ok"}` the whole time,
+        because it reported that sign-in was CONFIGURED and never asked
+        whether it WORKED. Nothing would have alerted us; a person found it.
+
+        Both stores, not one: they share a DATABASE_URL, so a missing driver
+        breaks them together, but a migration applied to one database and not
+        the other breaks exactly one, and that is the failure a single probe
+        would miss.
+
+        Values are `ok`, `unreachable` or `not_configured`. Never raises and
+        never hangs: the probes run concurrently under `timeout`, and
+        anything that goes wrong is an `unreachable` rather than a traceback,
+        because a health endpoint that 500s tells a monitor less than one
+        that answers.
+        """
+        import asyncio  # noqa: PLC0415 -- only this path needs it
+
+        async def probe(store: Any) -> str:
+            if store is None or not getattr(store, "available", False):
+                return "not_configured"
+            ping = getattr(store, "ping", None)
+            if ping is None:
+                # An older store object with no probe. Say so rather than
+                # claim an "ok" nothing checked.
+                return "unknown"
+            try:
+                await asyncio.wait_for(ping(timeout), timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 - every failure is one answer
+                logger.warning("sign-in store probe failed: %s", exc)
+                return "unreachable"
+            return "ok"
+
+        oauth_state, users_state = await asyncio.gather(
+            probe(self.store), probe(self.users)
+        )
+        return {"oauth": oauth_state, "free_users": users_state}
+
     # ── identity of this authorization server / resource ─────────────────
 
     @property
@@ -483,6 +588,19 @@ class OAuthSupport:
         """
         return f"{self.issuer}{MCP_PATH}"
 
+    def resource_for(self, path: str = MCP_PATH) -> str:
+        """The resource identifier to publish for one of the two paths.
+
+        `/mcp` and `/mcp/oauth` are one server and one audience -- see
+        `resource_url` and `resource_matches` -- but RFC 9728 §3.3 has a
+        client compare this string against the resource it asked about, so
+        the document served at the alias has to name the alias.
+        """
+        clean = (path or "").rstrip("/") or MCP_PATH
+        if clean not in (MCP_PATH, MCP_OAUTH_PATH):
+            return self.resource_url
+        return f"{self.issuer}{clean}"
+
     def resource_metadata_url(self, path: str = MCP_PATH) -> str:
         """The RFC 9728 document for one of the two paths.
 
@@ -490,25 +608,43 @@ class OAuthSupport:
         URL in it literally and RFC 9728 3.1 builds that URL by inserting the
         resource's path after the well-known segment. The unscoped path is
         served as well, for clients that construct it from the origin alone.
-        Both documents name the same `resource`; only the URL differs, so a
-        client that discovered us either way ends up asking for the same
-        audience.
+        Each document names the resource it was asked about (see
+        `resource_for`); all of those names resolve to the same audience,
+        because `resource_matches` accepts every one of them, so a client
+        that discovered us either way ends up with a token that works on
+        both paths.
         """
         return f"{self.issuer}{PROTECTED_RESOURCE_PATH}{path}"
 
     # ── metadata documents ───────────────────────────────────────────────
 
-    def protected_resource_metadata(self) -> dict[str, Any]:
+    def protected_resource_metadata(
+        self, path: str = MCP_PATH
+    ) -> dict[str, Any]:
         """RFC 9728. What resource this is and who can authorise it.
 
         Served for `/mcp` as well as for `/mcp/oauth`, which is what makes a
         client offering "authorization: always" sign the user in BEFORE the
-        first call rather than after the tenth. A client that does not look
-        is not broken: it gets the anonymous taster allowance and the
-        challenge when it runs out.
+        first call rather than after the tenth.
+
+        `resource` ECHOES THE PATH THE DOCUMENT WAS FETCHED FOR (2026-09-09).
+        RFC 9728 §3.3 tells a client to check that the `resource` value in the
+        document matches the resource identifier it just asked about, and a
+        client challenged on `/mcp/oauth` asks about
+        `/.well-known/oauth-protected-resource/mcp/oauth`. Returning
+        `.../mcp` there is a mismatch a strict client is entitled to reject,
+        and rejecting it looks to a user like "this server does not support
+        sign-in".
+
+        This does NOT split the token audience in two. `resource_matches`
+        accepts the origin, `/mcp` and `/mcp/oauth` as names for this one
+        server -- it always has -- and `validate_access_token` goes through
+        it, so a token minted for either name is spendable at both paths.
+        The alias and the primary path stay one server, one registry, one
+        allowance; only the string a discovery document echoes back changes.
         """
         return {
-            "resource": self.resource_url,
+            "resource": self.resource_for(path),
             "authorization_servers": [self.issuer],
             "scopes_supported": [DEFAULT_SCOPE],
             "bearer_methods_supported": ["header"],
@@ -1494,8 +1630,9 @@ class OAuthResourceGate:
        makes the injected value trustworthy.
     2. **`/mcp`** -- the URL we publish. A bearer token is RESOLVED here and
        becomes the injected identity; no token is answered 401 + the
-       challenge, so every served call on the free server belongs to a Google
-       account. `FREE_ANON_MODE=open` is the rollback and puts the old
+       challenge, so every served SEARCH on the free server belongs to a
+       Google account. Read-only discovery is served without one
+       (src/discovery.py). `FREE_ANON_MODE=open` is the rollback and puts the old
        anonymous behaviour back, capped by `anon_gate.AnonCapMiddleware`.
     3. **`/mcp/oauth`** -- the same behaviour under the name printed in old
        guides and saved in connectors added before 2026-09-09, so nobody has
@@ -1544,7 +1681,9 @@ class OAuthResourceGate:
                                  challenge arrives when that runs out. That
                                  is also what makes Smithery's release probe
                                  -- which arrives with no credential -- flip
-                                 its listing into OAuth mode.
+                                 its listing into OAuth mode. Read-only
+                                 discovery is served here in either mode
+                                 (src/discovery.py).
             always   /mcp/oauth  no token, no service. Kept for printed
                                  guides and for connectors already added on
                                  that URL, so nobody has to re-add a server.
@@ -1566,8 +1705,8 @@ class OAuthResourceGate:
                 {
                     "error": "not_found",
                     "error_description": (
-                        "This deployment does not have sign-in configured. "
-                        "Use /mcp, which is open and needs no account."
+                        "This deployment does not have sign-in configured, "
+                        "so there is nothing behind this path. Use /mcp."
                     ),
                 },
             )
@@ -1579,6 +1718,21 @@ class OAuthResourceGate:
 
         if not token:
             if always or anon_mode() == ANON_MODE_CHALLENGE:
+                # One question before the challenge, and only on `/mcp`: is
+                # this request merely LOOKING? `initialize`, `tools/list` and
+                # the rest of the read-only handshake are served to anybody.
+                # They spend no backend search and read no account, and
+                # refusing them is what marks the listing unhealthy on every
+                # directory that health-checks a connector with no
+                # credentials -- Glama does it hourly. `tools/call` still
+                # gets the 401, which is the whole point of the challenge.
+                # See src/discovery.py, including why it fails closed where
+                # the caps fail open.
+                if not always:
+                    looking, receive = await discovery_probe(scope, receive)
+                    if looking:
+                        await self.app(_rewrite(scope), receive, send)
+                        return
                 await _challenge(send, support, path, scope)
                 return
             # The ordinary anonymous request. Served, under the taster cap,
@@ -1749,9 +1903,9 @@ hotel rates on your behalf through the free FlightPowers server.</p>
       revoke it.</li>
 </ul>
 <p class="note">Signing in adds your email address to FlightPowers product
-updates. Every message carries an unsubscribe link, and
-<a href="/connect">this page</a> removes your account and your address
-entirely.</p>
+updates. Every message carries an unsubscribe link. You can delete your
+account and your address any time from
+<a href="/connect">your account page</a>.</p>
 <p class="note">It will be sent back to <code>{host}</code>.</p>
 </div>
 <form method="post" action="{e(AUTHORIZE_PATH)}">

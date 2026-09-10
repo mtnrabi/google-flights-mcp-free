@@ -9,9 +9,18 @@ you.
 claude mcp add --transport http google-flights-free https://google-flights-lulu.flightpowers.com/mcp
 ```
 
-Your client hits the URL, gets a `401` with the sign-in details, and shows a
-**Sign in** button. Sign in with Google and the four tools work. That is the
-whole setup: no key, no subscription, nothing else to configure.
+Adding the server needs no credential at all. On `/mcp` a request with nothing
+attached is served for `initialize`, `notifications/initialized`, `ping`,
+`tools/list`, `prompts/list` and `resources/list`, so your client connects and
+reads the whole tool menu straight away. The first actual search is what needs
+an account: a credential-less `tools/call` answers `401` with the sign-in
+details and the same directions body, and your client shows a **Sign in**
+button. Sign in with Google and the four tools work. That is the whole setup:
+no key, no subscription, nothing else to configure.
+
+`/mcp/oauth` is the same server with the challenge on everything, discovery
+included. That is the URL to hand a directory that wants "always requires
+auth", and it is what connectors saved before 2026-09-09 expect.
 
 Fair use, counted against the account you signed in with: **150 searches a day
 and 2,000 a calendar month.** One call spends one search per date × destination
@@ -63,12 +72,34 @@ than just quoting a number.
 An empty result list means "no flights on this route and date" — it is a valid
 answer, not an error.
 
+Every successful result also carries the compact usage receipt, so both the
+person and the model deciding whether to mention the paid server can see where
+the allowance stands:
+
+```json
+{"used_today": 7, "day_cap": 150, "used_month": 40, "month_cap": 2000,
+ "signed_in": true, "user": "traveller@example.com",
+ "human": "7 of 150 searches today, 40 of 2,000 this month, on traveller@example.com."}
+```
+
+A richer warning shape, with a `note` and an `upgrade` object, takes over from
+80% of a cap. The email is display only and never enters the counting key, so
+renaming a Google account does not reset an allowance.
+
 ### Fares are live, and only live
 
 Every call is a fresh search. **Fares go stale within minutes**, so results
 should never be cached, stored, or re-quoted later as if current. If an answer
 references a fare, it should say when it was fetched, and re-search rather than
 reuse.
+
+All four tools declare a `title` and the four MCP tool annotations:
+`readOnlyHint: true` (none of them can book, hold, pay for or cancel anything),
+`destructiveHint: false`, **`idempotentHint: false`** and `openWorldHint: true`
+(they reach a live third-party API whose result set is not a closed domain).
+`idempotentHint` is the one worth spelling out: a host that reads `true` is
+entitled to serve a cached answer to a repeated call, which means quoting a
+price that has already moved.
 
 ---
 
@@ -218,7 +249,20 @@ set -a && . .env && set +a
 .venv/bin/python -m src      # serves on :8000/mcp
 ```
 
-Health check at `/health`, live counters at `/metrics`.
+Health check at `/health`, live counters at `/metrics`. `/health` **probes** the
+sign-in stores rather than reporting configuration. One `SELECT 1` against each,
+run concurrently under a 2.5 s timeout, never raising:
+
+```json
+{"status":"degraded","signin_store":"unreachable",
+ "stores":{"oauth":"unreachable","free_users":"ok"}, "anon_mode":"challenge"}
+```
+
+`signin_store` is `ok | unreachable | not_configured` and `status` degrades with
+it. `?stores=0` keeps the cheap liveness answer with no database connection.
+Both `/health` and `/metrics` report `anon_mode` from the process actually
+answering, which is the only claim that settles whether a flipped env var
+reached the running code.
 
 ## Configuration
 
@@ -244,9 +288,21 @@ See `example.env` for every variable. The ones that matter most:
 The sign-in registers **nothing** unless `GOOGLE_OAUTH_CLIENT_ID`,
 `GOOGLE_OAUTH_CLIENT_SECRET` and `DATABASE_URL` are all set. A deployment
 missing any of them is exactly what this server was before: `/mcp` open to
-anyone, `/mcp/oauth` a 404. `FREE_ANON_MODE=open` is the softer rollback — it
-answers anonymous callers again at `FREE_ANON_DAILY_CAP`, one env var, no
-deploy — and `/mcp/oauth` challenges whatever that says.
+anyone, `/mcp/oauth` a 404. `FREE_ANON_MODE=open` is the softer rollback: it
+answers anonymous callers again at `FREE_ANON_DAILY_CAP`, and `/mcp/oauth`
+challenges whatever that says.
+
+It is **not** "one env var, no deploy". Two things have to be true for the flip
+to change anything. On Vercel an env var is baked into a deployment, so set it,
+redeploy, then confirm `"anon_mode": "open"` on `/health`; if health still says
+`challenge`, the running code never saw it. And `open` grants
+`FREE_ANON_DAILY_CAP` against the **same** per-day counter those callers were
+already spending at the ordinary cap, so anyone already past it stays refused,
+which looks exactly like "the switch did nothing". To restore service rather
+than offer a taster, raise `FREE_ANON_DAILY_CAP` to the ordinary day cap in the
+same redeploy. In either mode `initialize` and `tools/list` are never refused by
+a cap, so a client can always connect and read the directions. Only `tools/call`
+is gated.
 
 Run the migration once per database:
 
@@ -374,6 +430,7 @@ Shape below, with illustrative values — not usage figures:
  "budget": {"used_24h": 4, "budget": 1000, "remaining": 996,
             "enforceable": false},
  "durable_counters": false,
+ "config": {"anon_mode": "challenge", "anon_day_cap": 0, "...": "..."},
  "notes": ["..."]}
 ```
 
@@ -454,7 +511,7 @@ however well everything else works.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests -q     # 141 tests
+.venv/bin/python -m pytest tests -q     # 720 tests
 ```
 
 Backend and ad server are both stubbed, so the suite needs no network and no

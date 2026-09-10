@@ -467,12 +467,18 @@ def _scope(path="/mcp", method="POST", headers=None, query=b"", peer="198.51.100
     }
 
 
-async def _drive(middleware, scope):
-    """Run one request through the middleware and collect the response."""
+async def _drive(middleware, scope, method="tools/call"):
+    """Run one request through the middleware and collect the response.
+
+    The body carries a JSON-RPC `method`, because the escalation only ever
+    refuses a `tools/call`: `initialize` and `tools/list` spend no backend
+    search, and a client that cannot connect cannot read the refusal either.
+    """
     sent = []
+    body_bytes = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method}).encode()
 
     async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": body_bytes, "more_body": False}
 
     async def send(message):
         sent.append(message)
@@ -763,7 +769,22 @@ class TestOverTheWire:
             ) as client:
                 response = await client.post(
                     DEFAULT_MCP_PATH,
-                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                    # A `tools/call`: that is the only method an escalation
+                    # refuses. `initialize` and `tools/list` spend nothing and
+                    # are never blocked -- the test below pins that.
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "search_oneway_flights",
+                            "arguments": {
+                                "from_airport": "TLV",
+                                "to_airport": "FCO",
+                                "departure_date": "2026-10-14",
+                            },
+                        },
+                    },
                     headers={
                         **BATCH_HEADERS,
                         "content-type": "application/json",
@@ -773,6 +794,43 @@ class TestOverTheWire:
         assert response.status_code == 429
         assert int(response.headers["retry-after"]) >= 1
         assert response.json()["error"] == "rate_limited"
+
+    @pytest.mark.asyncio
+    async def test_a_hard_blocked_caller_can_still_connect_and_list(
+        self, hard_app
+    ):
+        """The escalation stops searches, not the protocol.
+
+        A client that cannot `initialize` cannot connect, cannot list the
+        tools and cannot show anyone the refusal -- it just fails. So the
+        429 is scoped to `tools/call`, and everything the client needs to
+        find out what happened keeps answering 200.
+        """
+        server, app = hard_app
+        await _seed(server.telemetry, 20)
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app, client=("198.51.100.7", 5000))
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                for method in ("initialize", "tools/list"):
+                    payload = {"jsonrpc": "2.0", "id": 1, "method": method}
+                    if method == "initialize":
+                        payload["params"] = {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {"name": "hard-limit-test", "version": "1"},
+                        }
+                    response = await client.post(
+                        DEFAULT_MCP_PATH,
+                        json=payload,
+                        headers={
+                            **BATCH_HEADERS,
+                            "content-type": "application/json",
+                            "accept": "application/json, text/event-stream",
+                        },
+                    )
+                    assert response.status_code == 200, method
 
     @pytest.mark.asyncio
     async def test_an_ordinary_caller_still_initialises(self, hard_app):

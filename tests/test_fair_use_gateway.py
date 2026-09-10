@@ -543,7 +543,11 @@ class TestEndToEnd:
             result = await client.call_tool("search_oneway_flights", SEARCH)
         assert len(backend_calls) == 1
         assert result.structured_content["result_count"] == 1
-        assert "fair_use" not in result.structured_content
+        # Counted and reported, not refused: a gateway user is 151 into the
+        # gateway allowance, not 1 over the direct one.
+        block = result.structured_content["fair_use"]
+        assert block["used_today"] == 151 and block["day_cap"] == 1500
+        assert not block.get("note")
 
     @pytest.mark.asyncio
     async def test_a_pooled_gateway_is_still_bounded(

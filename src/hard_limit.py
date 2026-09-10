@@ -30,9 +30,14 @@ session manager, never parses JSON-RPC, and never touches a tool.
 
 What it deliberately does not do
 --------------------------------
-* It does not read the request body. Identity comes from headers, the query
-  string and the peer address, exactly as `fair_use.identify` takes them, so
-  the middleware never has to buffer or replay a stream.
+* It does not refuse anything but a `tools/call`. `initialize`, `tools/list`,
+  `ping` and every notification pass through however many refusals are on the
+  counter: they spend no backend search, and a client that cannot `initialize`
+  cannot connect, cannot list the tools and cannot be told anything. Finding
+  the method costs buffering one small JSON-RPC request body, which is then
+  replayed to the app; the RESPONSE, which is the part that has to stream, is
+  never touched. Identity itself still comes only from headers, the query
+  string and the peer address, exactly as `fair_use.identify` takes them.
 * It does not decide who is a gateway. Pooled gateway keys are exempt from the
   escalation, and that exemption is enforced at the WRITE site
   (`stores.bump`), where the key kind was computed with the OpenAI egress feed
@@ -72,6 +77,81 @@ logger = logging.getLogger(__name__)
 #: explains why the slash matters elsewhere). `/mcp/` is accepted here too so
 #: the redirect target cannot become a way around the escalation.
 DEFAULT_MCP_PATH = "/mcp"
+
+
+#: The only JSON-RPC method a cap or an escalation may refuse. Everything
+#: else on `/mcp` -- `initialize`, `tools/list`, `ping`, notifications --
+#: spends no backend search, so refusing it takes away the client's ability
+#: to connect and buys nothing. On 2026-09-09, under the anonymous rollback
+#: mode, an anonymous `initialize` was answered 401 `rate_limited` because
+#: that day's counter was already past the taster cap: the client could not
+#: connect at all, and the rollback looked like it had done nothing.
+BILLABLE_METHOD = "tools/call"
+
+#: How much of a request body to buffer before giving up on finding the
+#: method. A JSON-RPC envelope for a tool call is a few hundred bytes; a
+#: megabyte of it is not one, and a gate is not the place to discover that.
+MAX_SNIFF_BYTES = 256 * 1024
+
+
+async def _buffered(
+    receive: Callable[[], Awaitable[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], Callable[[], Awaitable[dict[str, Any]]]]:
+    """Drain the request body, and hand back a `receive` that replays it.
+
+    The app downstream has not been called yet and will read the body itself,
+    so every message taken off the wire here has to be given back in order.
+    The replacement yields the buffered messages and then delegates to the
+    original `receive` -- which is what keeps a disconnect message flowing
+    through to the app instead of being swallowed.
+
+    Stops buffering at MAX_SNIFF_BYTES: past that we stop trying to find a
+    method and let the request through, because a gate is not a body parser
+    and "I could not tell" must not turn into "refused".
+    """
+    messages: list[dict[str, Any]] = []
+    size = 0
+    while True:
+        message = await receive()
+        messages.append(message)
+        if message.get("type") != "http.request":
+            break
+        size += len(message.get("body") or b"")
+        if not message.get("more_body") or size >= MAX_SNIFF_BYTES:
+            break
+
+    queue = list(messages)
+
+    async def replay() -> dict[str, Any]:
+        if queue:
+            return queue.pop(0)
+        return await receive()
+
+    return messages, replay
+
+
+def _method(messages: list[dict[str, Any]]) -> str:
+    """The JSON-RPC `method` in a buffered body, or "".
+
+    "" for anything that is not a single JSON-RPC object we can read -- a
+    batch, a truncated body, malformed JSON. That falls through to the app,
+    which is the safe direction: the tool layer counts and refuses on its own
+    (a 200 with `search_status: "rate_limited"`), so a body this cannot parse
+    costs a slightly worse refusal, not a free search.
+    """
+    raw = b"".join(
+        m.get("body") or b"" for m in messages if m.get("type") == "http.request"
+    )
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    method = parsed.get("method")
+    return method if isinstance(method, str) else ""
 
 
 def _headers(scope: Mapping[str, Any]) -> dict[str, str]:
@@ -187,6 +267,13 @@ class HardLimitMiddleware:
         send: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
         if not (self.armed and self._applies(scope)):
+            await self.app(scope, receive, send)
+            return
+
+        # `initialize` and `tools/list` are never escalated: a caller that
+        # cannot connect cannot read the refusal either. See BILLABLE_METHOD.
+        chunks, receive = await _buffered(receive)
+        if _method(chunks) != BILLABLE_METHOD:
             await self.app(scope, receive, send)
             return
 

@@ -52,3 +52,6 @@ fastapi>=0.115.0
 # use_fallback. Already a hard dependency of both fastmcp and fastapi;
 # declared here because it is now imported by our own code.
 pydantic>=2
+
+# OAuth/sign-in stores (src/oauthstore.py, src/freeusers.py) use asyncpg; missing on 2026-09-09 broke DCR (503) for ~25 min.
+asyncpg>=0.29

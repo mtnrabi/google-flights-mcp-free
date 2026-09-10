@@ -559,8 +559,14 @@ class TestThroughTheTools:
             })
         assert len(backend_calls) == 1
         assert result.structured_content["result_count"] == 1
-        # No warning while there is nothing to warn about.
-        assert "fair_use" not in result.structured_content
+        # The block is on every success since 2026-09-09, but in its compact
+        # shape: the counters and one sentence, no `note` and no `upgrade`,
+        # because there is nothing to warn about yet.
+        block = result.structured_content["fair_use"]
+        assert block["used_today"] == 1 and block["day_cap"] == 150
+        assert block["human"] == "1 of 150 searches today, 1 of 2,000 this month."
+        assert not block.get("note")
+        assert "upgrade" not in result.structured_content
 
     @pytest.mark.asyncio
     async def test_the_warning_arrives_before_the_wall(

@@ -207,6 +207,13 @@ NEVER_IDENTIFYING_PARAMS = ("api_key", "apikey", "key")
 #: becomes something a caller can hand themselves.
 SIGNED_IN_HEADER = "x-fp-oauth-subject"
 
+#: The signed-in caller's email, injected and stripped by the same gate. It
+#: is NOT part of the counting key -- the key is the Google `sub`, which never
+#: changes -- and it is carried only so a result can say WHOSE allowance the
+#: number belongs to. A user with two accounts otherwise has no way to tell
+#: which one their client is spending.
+SIGNED_IN_EMAIL_HEADER = "x-fp-oauth-email"
+
 #: Headers whose value our own edge sets and a caller cannot choose. Only
 #: these decide "is this a known gateway": the leftmost X-Forwarded-For entry
 #: is caller-supplied text and would let anyone claim the higher caps.
@@ -643,6 +650,10 @@ class ClientIdentity:
 
     key: str
     kind: str
+    #: The signed-in account's email, when there is one. Display only: it
+    #: never enters the counting key, so changing the address on a Google
+    #: account does not reset an allowance.
+    email: str = ""
 
     @property
     def pooled(self) -> bool:
@@ -681,7 +692,9 @@ def identify(
     subject = (headers.get(SIGNED_IN_HEADER) or "").strip()
     if subject:
         return ClientIdentity(
-            key=_digest(["sub", subject]), kind=KIND_SIGNED_IN
+            key=_digest(["sub", subject]),
+            kind=KIND_SIGNED_IN,
+            email=(headers.get(SIGNED_IN_EMAIL_HEADER) or "").strip(),
         )
 
     base = _base_parts(headers)
@@ -857,8 +870,51 @@ def _limiting_percent(state: FairUseState) -> tuple[int, str]:
     return day_pct, "today"
 
 
-def fair_use_note(state: FairUseState) -> dict[str, Any]:
+def usage_note(state: FairUseState, email: str = "") -> dict[str, Any]:
+    """The `fair_use` block carried on EVERY successful result.
+
+    Until 2026-09-09 this object appeared only from 80% of a cap onwards
+    (`fair_use_note`). That made the number invisible for the first 119 of a
+    signed-in user's 150 daily searches -- so a user had no way to see where
+    they stood, and the model had nothing to nudge with until the allowance
+    was nearly gone. The whole upsell rests on the caller knowing the number
+    before it becomes a problem, and a paid server is a hard sell to somebody
+    who has never once been shown what they are using.
+
+    Deliberately small and deliberately boring: the four counters, whose
+    allowance it is, and one plain sentence a model can read out loud. The
+    rich version -- the warning percentage, the directions, the `upgrade`
+    object beside it -- still arrives at 80%, because that is when there is
+    something to DO about it. This is a receipt, not a warning.
+
+    `used_today` here is the count INCLUDING the call being answered: the
+    caller is told where they stand now, not where they stood a moment ago.
+    """
+    payload: dict[str, Any] = {
+        "used_today": state.used_today,
+        "day_cap": state.day_cap,
+        "used_month": state.used_month,
+        "month_cap": state.month_cap,
+        "signed_in": state.signed_in,
+    }
+    if email:
+        payload["user"] = email
+    sentence = f"{state.used_today:,} of {state.day_cap:,} searches today"
+    if state.month_cap:
+        sentence += f", {state.used_month:,} of {state.month_cap:,} this month"
+    payload["human"] = (
+        sentence
+        + (f", on {email}." if email else (" for this account." if state.signed_in else "."))
+    )
+    return payload
+
+
+def fair_use_note(state: FairUseState, email: str = "") -> dict[str, Any]:
     """The `fair_use` object carried on a normal result once it is 80% spent.
+
+    The RICH form. `usage_note` above is what a result carries the rest of the
+    time; this one replaces it from 80% of either cap, adding the percentage,
+    the directions and the `upgrade` object beside it.
 
     `upgrade` (the same object a refusal carries) rides alongside this on the
     result -- see where callers attach it in server.py -- so `note` can point
@@ -919,6 +975,10 @@ def fair_use_note(state: FairUseState) -> dict[str, Any]:
         "human": human,
         "note": note,
     }
+    if email:
+        # Same key as `usage_note`, so a client that reads `fair_use.user`
+        # keeps reading it when the block switches to this richer shape.
+        payload["user"] = email
     if directions:
         # The same sentence, on its own key as well as inside `note`. A model
         # reads `note`; a script that dumps one field reads this.

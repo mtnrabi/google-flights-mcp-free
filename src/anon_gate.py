@@ -32,9 +32,17 @@ What it deliberately does not do
   capped by the tool layer against its own, much larger allowance. A signed-in
   user can never be blocked by another user's usage: their key is their Google
   account and nothing else.
-* **It does not read the request body.** Identity comes from headers, the
-  query string and the peer address, exactly as `fair_use.identify` takes
-  them, so nothing has to be buffered or replayed.
+* **It only refuses a `tools/call`.** `initialize`, `tools/list`, `ping` and
+  every notification pass through whatever the counter says. They spend no
+  backend search, so refusing them buys nothing and costs everything: a
+  client that cannot `initialize` cannot connect, cannot list the tools and
+  cannot show the user what the server is -- it just fails. On 2026-09-09,
+  with the rollback mode on, an anonymous `initialize` was answered 401
+  `rate_limited` because that day's counter was already past the taster cap,
+  which is what made the rollback look like it had done nothing at all.
+  Reading the method costs buffering one small JSON-RPC request body, which
+  is then replayed to the app; the RESPONSE, which is the part that has to
+  stream, is untouched.
 * **It does not count the refusal.** The soft-refusal counter that arms the
   429 escalation (`hard_limit.py`) is written by the tool layer; a request
   refused here never reaches it. That is deliberate: a 401 is already a status
@@ -58,7 +66,15 @@ from .fair_use import (
     log_line,
     rate_limited_result,
 )
-from .hard_limit import DEFAULT_MCP_PATH, _headers, _query
+from .hard_limit import (
+    BILLABLE_METHOD,
+    DEFAULT_MCP_PATH,
+    _buffered,
+    _headers,
+    _method,
+    _query,
+)
+from .oauth import anon_caps
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +173,14 @@ class AnonCapMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # Read the JSON-RPC method first, and replay the body whatever we
+        # decide. `initialize` and `tools/list` are never refused here: see
+        # BILLABLE_METHOD and the module docstring.
+        chunks, receive = await _buffered(receive)
+        if _method(chunks) != BILLABLE_METHOD:
+            await self.app(scope, receive, send)
+            return
+
         try:
             identity = self._identity(scope)
         except Exception as exc:  # noqa: BLE001 - never fail a request here
@@ -184,14 +208,15 @@ class AnonCapMiddleware:
             await self.app(scope, receive, send)
             return
 
+        anon_day_cap, anon_month_cap = anon_caps(self._settings)
         day_cap, month_cap = caps_for(
             identity.kind,
             day_cap=self._settings.fair_use_day_cap,
             month_cap=self._settings.fair_use_month_cap,
             gateway_day_cap=self._settings.fair_use_gateway_day_cap,
             gateway_month_cap=self._settings.fair_use_gateway_month_cap,
-            anon_day_cap=getattr(self._settings, "anon_day_cap", 0),
-            anon_month_cap=getattr(self._settings, "anon_month_cap", 0),
+            anon_day_cap=anon_day_cap,
+            anon_month_cap=anon_month_cap,
         )
         used_today, used_month = await self._telemetry.fair_use_usage(identity.key)
         state = FairUseState(

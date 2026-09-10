@@ -129,6 +129,8 @@ class FreeUser:
 class FreeUserStore(Protocol):
     available: bool
 
+    async def ping(self, timeout: float = 0.0) -> bool: ...
+
     async def upsert(
         self,
         google_sub: str,
@@ -165,6 +167,11 @@ class NullFreeUserStore:
 
     available = False
 
+    async def ping(self, timeout: float = 0.0) -> bool:
+        """Nothing to reach. `available` is False, so `/health` reports this
+        as "not configured" rather than as an outage."""
+        return False
+
     async def upsert(
         self,
         google_sub: str,
@@ -200,6 +207,9 @@ class MemoryFreeUserStore:
     """In-process, for tests and `python -m src` on a laptop."""
 
     available = True
+
+    async def ping(self, timeout: float = 0.0) -> bool:
+        return True
 
     def __init__(self) -> None:
         self.rows: dict[str, FreeUser] = {}
@@ -383,6 +393,23 @@ class PostgresFreeUserStore:
             raise UserStoreError(f"user store operation failed: {exc}") from exc
         finally:
             await conn.close()
+
+    async def ping(self, timeout: float = 0.0) -> bool:
+        """One `SELECT 1`. Raises `UserStoreError` if the store is unreachable.
+
+        The sign-in feature reads TWO stores -- this one and
+        `oauthstore` -- and on 2026-09-09 one of them was dead while
+        `/health` reported `ok`. Probing both is the point: a missing driver
+        or a bad DATABASE_URL breaks them together, but a migration that ran
+        on one database and not the other breaks exactly one.
+        """
+        limit = timeout if timeout and timeout > 0 else self._connect_timeout
+        original, self._connect_timeout = self._connect_timeout, limit
+        try:
+            await self._run(lambda conn: conn.fetchval("SELECT 1"))
+        finally:
+            self._connect_timeout = original
+        return True
 
     async def upsert(
         self,

@@ -55,6 +55,7 @@ from .oauth import (
     TOKEN_PATH,
     OAuthError,
     OAuthSupport,
+    anon_caps,
     consent_html,
     error_html,
     redirect_with,
@@ -160,24 +161,24 @@ def signed_out_html(sign_in_url: str, banner: str = "") -> str:
         "Sign in to FlightPowers free",
         "<h1>Sign in to FlightPowers free</h1>"
         + warning
-        + "<p>The free server works without an account and always will. "
-        "Signing in changes one thing: your daily allowance is counted "
-        "against <strong>your account</strong> instead of a guess made from "
-        "your IP address and your user agent, which is what everyone behind "
-        "the same gateway currently shares.</p>"
+        + "<p>The free server needs a Google sign-in, and that is the whole "
+        "sign-up: your daily allowance is counted against <strong>your "
+        "account</strong> instead of a guess made from your IP address and "
+        "your user agent, which is what everyone behind the same gateway "
+        "used to share.</p>"
         "<p>There is nothing to paste. No RapidAPI key, no card, no "
         "configuration file.</p>"
         f'<p><a class="btn" href="/connect/start">Sign in with Google</a></p>'
         '<p class="note">We ask Google for two things only: your account id '
         "and your email address. Signing in adds that address to FlightPowers "
-        "product updates, and every message carries an unsubscribe link. "
-        "Coming back to this page removes your account and your address "
-        "entirely.</p>"
+        "product updates, and every message carries an unsubscribe link. You "
+        "can delete your account and your address any time from this page.</p>"
         "<h2>Using it from your MCP client</h2>"
         f"<pre>{e(sign_in_url)}</pre>"
         "<p>Add that URL to a client that supports MCP authorization and it "
-        "will offer a Sign in button. Clients that do not can keep using "
-        "the open endpoint with no account at all.</p>" + footer(),
+        "will offer a Sign in button. A client that cannot sign in gets a "
+        "401 with the directions in it, and should use a RapidAPI key on the "
+        "paid server instead.</p>" + footer(),
     )
 
 
@@ -194,6 +195,11 @@ def signed_in_html(
         f"<p>Your allowance is <strong>{day_cap:,} searches a day</strong>, "
         "counted against this account."
         + (
+            # Printed only when an anonymous tier actually exists -- that is,
+            # under the `FREE_ANON_MODE=open` rollback. In the shipped
+            # configuration nothing is served without an account, so a
+            # sentence about what such a caller gets would be a number no
+            # caller can reach. `oauth.anon_caps` is what decides.
             f" A caller with no account shares {anon_day_cap:,} a day with "
             "everyone else on their connection."
             if anon_day_cap and anon_day_cap != day_cap
@@ -224,8 +230,8 @@ def signed_in_html(
         "<h2>Delete everything</h2>"
         "<p>This removes your account id, your email address and every token "
         "any client holds for you. Your client will ask you to sign in again "
-        "the next time it calls, and the open endpoint keeps working with no "
-        "account.</p>"
+        "the next time it calls, and signing in again gives you a fresh "
+        "account with a fresh allowance.</p>"
         f'<form method="post" action="/connect/delete">'
         f'<input type="hidden" name="csrf" value="{e(csrf)}">'
         '<p><button class="btn danger" type="submit">Delete my account</button></p>'
@@ -252,7 +258,16 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
     _canonical_host = site_origin.split("://", 1)[-1].rstrip("/").lower()
     day_cap = getattr(settings, "fair_use_day_cap", 0)
     month_cap = getattr(settings, "fair_use_month_cap", 0)
-    anon_day_cap = getattr(settings, "anon_day_cap", day_cap)
+    def _anon_day_cap() -> int:
+        """The anonymous day cap AS OF THIS REQUEST, not as of boot.
+
+        Read per request, through `oauth.anon_caps`, for two reasons. It is 0
+        unless `FREE_ANON_MODE=open` -- in the shipped configuration there is
+        no anonymous tier, so the pages must not print one -- and the mode
+        lives in an environment variable somebody may flip between one
+        request and the next.
+        """
+        return anon_caps(settings)[0]
 
     def _set_cookie(response: Response, name: str, value: str, max_age: int) -> None:
         """HttpOnly, SameSite=Lax, scoped to /connect.
@@ -313,7 +328,7 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
                 sign_in_url=sign_in_url,
                 csrf=oauth.csrf(identity.sub),
                 day_cap=day_cap,
-                anon_day_cap=anon_day_cap,
+                anon_day_cap=_anon_day_cap(),
                 notice=(
                     "You are signed in."
                     if request.query_params.get("welcome")
@@ -535,11 +550,29 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
 
     # ── discovery ────────────────────────────────────────────────────────
 
-    async def _protected_resource(_request: Request) -> Response:
-        return JSONResponse(
-            oauth.protected_resource_metadata(),
-            headers={"Cache-Control": _METADATA_CACHE},
-        )
+    def _protected_resource_for(path: str):
+        """One handler per well-known suffix, bound to the path it describes.
+
+        RFC 9728 §3.3 has a client check that the `resource` in the document
+        it fetched names the resource it asked about. A client challenged on
+        `/mcp/oauth` fetches `.../oauth-protected-resource/mcp/oauth`, so
+        that document has to say `.../mcp/oauth`; the bare well-known path
+        and the `/mcp` one say `.../mcp`. All three are the same audience --
+        `oauth.resource_matches` accepts every one of them and
+        `validate_access_token` goes through it -- so a token minted after
+        discovery on either path is spendable on both.
+        """
+
+        async def handler(_request: Request) -> Response:
+            return JSONResponse(
+                oauth.protected_resource_metadata(path),
+                headers={"Cache-Control": _METADATA_CACHE},
+            )
+
+        # Starlette names a route after the function; three closures all
+        # called `handler` would be three routes with one name.
+        handler.__name__ = "protected_resource" + path.replace("/", "_")
+        return handler
 
     async def _authorization_server(_request: Request) -> Response:
         return JSONResponse(
@@ -560,7 +593,7 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
     # presents to a user as "this server does not support sign-in".
     for suffix in ("", MCP_PATH, MCP_OAUTH_PATH):
         mcp.custom_route(f"{PROTECTED_RESOURCE_PATH}{suffix}", methods=["GET"])(
-            _protected_resource
+            _protected_resource_for(suffix or MCP_PATH)
         )
         mcp.custom_route(f"{AUTHORIZATION_SERVER_PATH}{suffix}", methods=["GET"])(
             _authorization_server
@@ -700,7 +733,7 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
                     sealed=oauth.seal_request(validated, identity.sub),
                     csrf=oauth.csrf(identity.sub),
                     day_cap=day_cap,
-                    anon_day_cap=anon_day_cap,
+                    anon_day_cap=_anon_day_cap(),
                 ),
             )
         )
