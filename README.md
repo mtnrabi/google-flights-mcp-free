@@ -129,6 +129,14 @@ kept is your Google account id and your email address, nothing else: no
 RapidAPI key (there is none to give), no browsing history, no search history
 tied to your name beyond the counters that enforce the caps.
 
+**Your email gets a welcome note, and occasionally a cap note.** The first
+sign-in sends a one-time welcome, and an account that keeps hitting the day or
+month cap can get one note pointing at the paid server, at most once every 30
+days and never within 72 hours of the welcome. Both are transactional sends,
+not a newsletter, both are off unless the operator turns them on, and every
+one carries an unsubscribe link that goes through this server's own
+`/email/unsubscribe` route rather than a generic list-management page.
+
 Because ads are involved, this server is **not** listed in the official MCP
 Registry or in the Anthropic and OpenAI directories: all three ban ad-carrying
 servers. That is a deliberate, known consequence of the free model, not an
@@ -280,8 +288,11 @@ See `example.env` for every variable. The ones that matter most:
 | `MAX_BACKEND_CALLS_PER_TOOL_CALL` | The cost cap. Default 15. |
 | `ENFORCEMENT_MODE` | `off` / `monitor` / `enforce`. Default `monitor`. |
 | `GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` | Google sign-in. Redirect URI is `<origin>/connect/callback`, scopes `openid` and `.../auth/userinfo.email`. |
-| `DATABASE_URL` | Neon Postgres, **pooled** endpoint. Schema: `migrations/001_free_mcp_signin.sql`. |
+| `DATABASE_URL` | Neon Postgres, **pooled** endpoint. Schema: `migrations/001_free_mcp_signin.sql`, `migrations/002_free_mcp_email.sql`. |
 | `FAIR_USE_DAY_CAP` / `FAIR_USE_MONTH_CAP` | The per-account allowance. 150 and 2,000. |
+| `RESEND_API_KEY` | Sends the welcome and cap-note transactional emails. Empty means neither can send, regardless of the two flags below. |
+| `FREE_SIGNIN_WELCOME` | `on` sends the one-time welcome note at first sign-in. Default off. |
+| `FREE_SIGNIN_CAPNOTE` | `on` sends the cap note when an account keeps hitting the day/month cap. At most one per user per 30 days, never within 72h of the welcome. Default off. |
 
 ### Sign-in is all-or-nothing, and that is the rollback
 
@@ -304,10 +315,11 @@ same redeploy. In either mode `initialize` and `tools/list` are never refused by
 a cap, so a client can always connect and read the directions. Only `tools/call`
 is gated.
 
-Run the migration once per database:
+Run the migrations once per database, in order:
 
 ```bash
 psql "$DATABASE_URL" -f migrations/001_free_mcp_signin.sql
+psql "$DATABASE_URL" -f migrations/002_free_mcp_email.sql
 ```
 
 Tables are `free_mcp_*` on purpose: a token minted here must never be one the
@@ -511,7 +523,7 @@ however well everything else works.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests -q     # 720 tests
+.venv/bin/python -m pytest tests -q     # 803 tests
 ```
 
 Backend and ad server are both stubbed, so the suite needs no network and no

@@ -1362,7 +1362,13 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             "real spend will exceed the budget silently. Set "
             "UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN."
         )
-    def _note_signed_in_usage(headers: dict[str, str], spent: int) -> None:
+    def _note_signed_in_usage(
+        headers: dict[str, str],
+        spent: int,
+        *,
+        tool: str = "",
+        day_capped: bool = False,
+    ) -> None:
         """Record a signed-in call against the account, in the background.
 
         Best effort, and deliberately so: it runs after the tool has already
@@ -1375,13 +1381,22 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         with an email address attached, for the daily read and for the
         phase-2 cap note.
 
+        `day_capped` is the other half: the DAY cap refusing this account,
+        which is what branch D of the cap note counts and the one event
+        nothing else in the system remembers -- the Upstash counter knows
+        the number but not the person, and a refusal spends no searches, so
+        the usage row would not show it. A refusal writes no usage and a
+        search writes no refusal; a call is never both.
+
         The `sub` comes from the header the OAuth gate injects after a token
         validates and strips from every inbound request, so it cannot be set
         by the caller. If that strip is ever removed, this becomes a way to
         write rows for somebody else's account.
         """
         oauth = getattr(mcp, "fp_oauth", None)
-        if oauth is None or oauth.users is None or spent <= 0:
+        if oauth is None or oauth.users is None:
+            return
+        if spent <= 0 and not day_capped:
             return
         sub = (headers.get(SIGNED_IN_HEADER) or "").strip()
         if not sub:
@@ -1389,9 +1404,32 @@ def build_server(settings: Settings | None = None) -> FastMCP:
 
         async def go() -> None:
             try:
-                await oauth.users.touch(sub, spent)
+                if day_capped:
+                    await oauth.users.note_cap_hit(sub)
+                if spent > 0:
+                    await oauth.users.touch(sub, spent, tool=tool)
             except Exception as exc:  # noqa: BLE001 - never fail a tool call
                 logger.debug("could not record signed-in usage: %s", exc)
+            # The cap note, evaluated on the row this call just wrote. Off
+            # unless FREE_SIGNIN_CAPNOTE=on, guarded in one UPDATE, and it
+            # can no more fail this tool call than the write above can --
+            # the response was sent before any of this started.
+            mail = getattr(oauth, "mail", None)
+            if mail is None or not getattr(mail, "cap_note", False):
+                return
+            try:
+                from .maillist import maybe_send_cap_note  # noqa: PLC0415
+
+                branch = await maybe_send_cap_note(
+                    oauth.users,
+                    sub,
+                    mail,
+                    month_cap=settings.fair_use_month_cap,
+                )
+                if branch:
+                    logger.info("free-mcp cap note sent, branch %s", branch)
+            except Exception as exc:  # noqa: BLE001 - never fail a tool call
+                logger.debug("cap-note pass failed: %s", exc)
 
         try:
             asyncio.create_task(go())
@@ -1555,8 +1593,11 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             ad_eligible: bool,
             error: str | None,
             fair_use_blocked: bool = False,
+            day_capped: bool = False,
         ) -> None:
-            _note_signed_in_usage(headers, calls)
+            _note_signed_in_usage(
+                headers, calls, tool=tool_name, day_capped=day_capped
+            )
             await telemetry.record(
                 CallRecord(
                     timestamp=time.time(),
@@ -1644,6 +1685,11 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                     ad_eligible=False,
                     error="fair_use_blocked",
                     fair_use_blocked=True,
+                    # Branch D of the cap note is "a scan stopped before it
+                    # finished", which is the DAY cap. A month-cap refusal
+                    # is a different conversation and must not be counted
+                    # as one of the two days in a week.
+                    day_capped=fair_use.limit_reached == "day",
                 )
                 return rate_limited_result(fair_use)
 
