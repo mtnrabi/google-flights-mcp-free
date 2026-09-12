@@ -1,5 +1,7 @@
 # Google Flights MCP — free, ad-supported
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/mtnrabi-google-flights-mcp-free-1svtip?vY923e1ddadb4a76a42309fc45e72a13&variant=verified)](https://m8ven.ai/mcp/mtnrabi-google-flights-mcp-free-1svtip)
+
 Real-time one-way and round-trip flight search, and live Booking.com hotel
 rates, for any MCP client. **No API key: sign in with Google and go.** It is
 funded by one disclosed sponsored card attached to each result, not by charging
