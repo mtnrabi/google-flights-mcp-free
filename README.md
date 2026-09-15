@@ -24,8 +24,8 @@ no key, no subscription, nothing else to configure.
 included. That is the URL to hand a directory that wants "always requires
 auth", and it is what connectors saved before 2026-09-09 expect.
 
-Fair use, counted against the account you signed in with: **150 searches a day
-and 2,000 a calendar month.** One call spends one search per date × destination
+Fair use, counted against the account you signed in with: **50 searches a day
+and 250 a calendar month.** One call spends one search per date × destination
 combination, so a wide search costs more than one, and a single call is capped
 at 15 combinations. Past either cap the tools answer with `search_status:
 "rate_limited"` and no results.
@@ -79,9 +79,9 @@ person and the model deciding whether to mention the paid server can see where
 the allowance stands:
 
 ```json
-{"used_today": 7, "day_cap": 150, "used_month": 40, "month_cap": 2000,
+{"used_today": 7, "day_cap": 50, "used_month": 40, "month_cap": 250,
  "signed_in": true, "user": "traveller@example.com",
- "human": "7 of 150 searches today, 40 of 2,000 this month, on traveller@example.com."}
+ "human": "7 of 50 searches today, 40 of 250 this month, on traveller@example.com."}
 ```
 
 A richer warning shape, with a `note` and an `upgrade` object, takes over from
@@ -169,7 +169,7 @@ fan-out cap, or the client restriction start getting in your way.
 |---|---|---|
 | Ads | one disclosed sponsored card per result | none |
 | Credential | sign in with Google, no key | sign in with Google **and** your own RapidAPI key, or just the key |
-| Searches | 150 a day, 2,000 a calendar month, per account | whatever your RapidAPI plan holds |
+| Searches | 50 a day, 250 a calendar month, per account | whatever your RapidAPI plan holds |
 | Fan-out cap per call | 15 searches | 30 searches (hard max 60; per-call `max_searches` override) |
 | Spend reporting | n/a | `api_usage` on every response |
 | Client restrictions | classified by tier; non-rendering clients may be capped or refused | none — any client, any transport |
@@ -291,7 +291,7 @@ See `example.env` for every variable. The ones that matter most:
 | `ENFORCEMENT_MODE` | `off` / `monitor` / `enforce`. Default `monitor`. |
 | `GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` | Google sign-in. Redirect URI is `<origin>/connect/callback`, scopes `openid` and `.../auth/userinfo.email`. |
 | `DATABASE_URL` | Neon Postgres, **pooled** endpoint. Schema: `migrations/001_free_mcp_signin.sql`, `migrations/002_free_mcp_email.sql`. |
-| `FAIR_USE_DAY_CAP` / `FAIR_USE_MONTH_CAP` | The per-account allowance. 150 and 2,000. |
+| `FAIR_USE_DAY_CAP` / `FAIR_USE_MONTH_CAP` | The per-account allowance. 50 and 250 (production; code default is 150 and 2,000). |
 | `RESEND_API_KEY` | Sends the welcome and cap-note transactional emails. Empty means neither can send, regardless of the two flags below. |
 | `FREE_SIGNIN_WELCOME` | `on` sends the one-time welcome note at first sign-in. Default off. |
 | `FREE_SIGNIN_CAPNOTE` | `on` sends the cap note when an account keeps hitting the day/month cap. At most one per user per 30 days, never within 72h of the welcome. Default off. |
