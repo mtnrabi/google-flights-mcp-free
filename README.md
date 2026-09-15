@@ -8,7 +8,7 @@ funded by one disclosed sponsored card attached to each result, not by charging
 you.
 
 ```
-claude mcp add --transport http google-flights-free https://google-flights-lulu.flightpowers.com/mcp
+claude mcp add --transport http google-flights-free https://free-trial.flightpowers.com/mcp
 ```
 
 Adding the server needs no credential at all. On `/mcp` a request with nothing
