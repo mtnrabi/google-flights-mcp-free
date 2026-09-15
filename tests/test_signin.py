@@ -201,7 +201,7 @@ class TestTheEndpoints:
         assert body["id"] is None
         assert body["error"]["message"] == signin_directions()
         assert "Sign in with Google" in body["error"]["message"]
-        assert "google-flights-lulu.flightpowers.com/mcp" in body["error"]["message"]
+        assert "free-trial.flightpowers.com/mcp" in body["error"]["message"]
         assert "flights.flightpowers.com/mcp" in body["error"]["message"]
 
     @pytest.mark.asyncio
@@ -383,7 +383,7 @@ class TestTheExactDirections:
         assert "10 a day" in text
         assert "150 a day and 2,000 a month" in text
         assert "Sign in with Google" in text
-        assert "https://google-flights-lulu.flightpowers.com/mcp/oauth" in text
+        assert "https://free-trial.flightpowers.com/mcp/oauth" in text
         assert "https://flights.flightpowers.com/mcp" in text
         assert "https://hotels.flightpowers.com/mcp" in text
 
@@ -393,7 +393,7 @@ class TestTheExactDirections:
         somebody else's software."""
         text = anon_directions(1500, 150, 2000, pooled=True)
         assert "shared connection" in text
-        assert "add https://google-flights-lulu.flightpowers.com/mcp" in text
+        assert "add https://free-trial.flightpowers.com/mcp" in text
         assert "Sign in button" not in text
 
     def test_the_refusal_carries_them(self):

@@ -271,8 +271,8 @@ SIGNIN_HOTELS_URL = "https://hotels.flightpowers.com/mcp/oauth"
 # clients that fix the auth mode when a server is ADDED and cannot act on a
 # 401 that arrives later (ChatGPT connectors, Claude's connector UI saved
 # with auth "None").
-FREE_MCP_URL = "https://google-flights-lulu.flightpowers.com/mcp"
-FREE_SIGNIN_URL = "https://google-flights-lulu.flightpowers.com/mcp/oauth"
+FREE_MCP_URL = "https://free-trial.flightpowers.com/mcp"
+FREE_SIGNIN_URL = "https://free-trial.flightpowers.com/mcp/oauth"
 
 FLIGHTS_LISTING_URL = "https://rapidapi.com/mtnrabi/api/google-flights-live-api"
 HOTELS_LISTING_URL = "https://rapidapi.com/mtnrabi/api/booking-live-api"
