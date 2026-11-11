@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from typing import Any, Literal
 
 import httpx
@@ -39,6 +40,17 @@ ENDPOINT_MAP = {
 # problem, not a transient one, and retrying just delays a clear error.
 _RETRYABLE_STATUS = {500, 502, 503, 504}
 _MAX_ATTEMPTS = 2
+# Only a FAST fault is worth a second attempt. /search already retries a
+# Booking bounce on a fresh IP inside the Lambda, so its 502 lands at ~65-70 s
+# (all 9 free-server /search failures of 2026-10-16/17); retrying that doubled
+# the wait to ~135 s for the same answer. A timeout is slow by definition.
+_RETRY_ONLY_UNDER_SECONDS = 20.0
+
+
+class HotelsBackendDown(LambdaError):
+    """The backend never produced an answer: a 5xx, a timeout or a connection
+    error. A 4xx or a non-JSON body is a plain LambdaError, because the
+    search_hotels "re-search with the city" advice does not fit those."""
 
 
 def _compact(payload: dict[str, Any]) -> dict[str, Any]:
@@ -151,13 +163,14 @@ class HotelsLambdaClient:
 
         last_error = "unknown"
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            started = time.monotonic()
             try:
                 response = await self._client.post(
                     url, json=payload, headers=headers, timeout=self._timeout
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
-                if attempt == _MAX_ATTEMPTS:
+                if attempt == _MAX_ATTEMPTS or self._slow(started):
                     break
                 await self._backoff(attempt)
                 continue
@@ -168,13 +181,17 @@ class HotelsLambdaClient:
             last_error = f"HTTP {response.status_code}: {response.text[:300]}"
             if response.status_code not in _RETRYABLE_STATUS:
                 raise LambdaError(f"{endpoint} failed -- {last_error}")
-            if attempt == _MAX_ATTEMPTS:
+            if attempt == _MAX_ATTEMPTS or self._slow(started):
                 break
             await self._backoff(attempt)
 
-        raise LambdaError(
-            f"{endpoint} failed after {_MAX_ATTEMPTS} attempts -- {last_error}"
+        raise HotelsBackendDown(
+            f"{endpoint} failed after {attempt} attempt(s) -- {last_error}"
         )
+
+    @staticmethod
+    def _slow(started: float) -> bool:
+        return time.monotonic() - started > _RETRY_ONLY_UNDER_SECONDS
 
     @staticmethod
     def _parse(response: httpx.Response) -> list[dict[str, Any]]:

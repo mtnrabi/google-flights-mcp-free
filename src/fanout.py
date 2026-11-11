@@ -39,6 +39,7 @@ from typing import Any, Callable, Literal
 from .fair_use import (
     FLIGHTS_LISTING_URL,
     PAID_FLIGHTS_URL,
+    PAID_TRIAL_DAY_CAP,
     SIGNIN_FLIGHTS_URL,
 )
 
@@ -293,8 +294,10 @@ class SearchPlan:
                 "and searches 30 combinations per call by default -- up to 60 "
                 "with its `max_searches` argument. Sign in with Google at "
                 f"{SIGNIN_FLIGHTS_URL} and there is no key to paste into your "
-                f"client, or bring your own key to {PAID_FLIGHTS_URL} in an "
-                "`x-rapidapi-key` header. BASIC is free at "
+                f"client: the first {PAID_TRIAL_DAY_CAP} searches each day are "
+                "free and ad-free on our key there, before any RapidAPI plan "
+                f"is involved. Or bring your own key to {PAID_FLIGHTS_URL} in "
+                "an `x-rapidapi-key` header. BASIC is free at "
                 f"{FLIGHTS_LISTING_URL}"
             )
         if self.degraded_reason:

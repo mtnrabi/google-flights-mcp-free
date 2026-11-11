@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from src.lambda_client import (
+    DegradedSearchError,
     LambdaClient,
     LambdaError,
     build_oneway_payload,
@@ -180,6 +181,78 @@ class TestSearch:
 
         with pytest.raises(LambdaError, match="non-JSON"):
             asyncio.run(run())
+
+
+def _degraded(status: int, body: dict) -> httpx.Response:
+    return httpx.Response(
+        status,
+        json=body,
+        headers={
+            "X-Search-Status": "degraded",
+            "X-Search-Reason": "upstream_no_render",
+        },
+    )
+
+
+class TestDegradedIsNeverResent:
+    """A degraded 5xx is a search the backend ran and judged; the api front
+    never resends one (degraded_search_error) and neither does this client."""
+
+    @pytest.mark.parametrize("retry", [False, True])
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    def test_sent_once_and_the_verdict_rides_on_the_error(self, status, retry):
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            return _degraded(status, {
+                "error": "search_incomplete",
+                "search_status": "degraded",
+                "search_reason": "upstream_no_render",
+                "message": "The flight search did not complete.",
+                "hint": "Price the two one-way legs instead.",
+                "retry": retry,
+            })
+
+        async def run():
+            async with _client(handler) as c:
+                await c.search("roundtrip", {})
+
+        with pytest.raises(DegradedSearchError) as exc:
+            asyncio.run(run())
+        assert attempts["n"] == 1
+        assert exc.value.retry is retry
+        assert exc.value.backend_message == "The flight search did not complete."
+        assert exc.value.hint == "Price the two one-way legs instead."
+        assert isinstance(exc.value, LambdaError)
+        assert f"HTTP {status}:" in str(exc.value)
+
+    @pytest.mark.parametrize("body", [{"error": "search_incomplete"}, {"retry": "no"}])
+    def test_absent_or_non_boolean_retry_is_none(self, body):
+        async def run():
+            async with _client(lambda r: _degraded(503, body)) as c:
+                await c.search("oneway", {})
+
+        with pytest.raises(DegradedSearchError) as exc:
+            asyncio.run(run())
+        assert exc.value.retry is None
+        assert exc.value.hint is None
+
+    def test_a_plain_503_without_the_header_is_still_retried(self):
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            return httpx.Response(503, json={"retry": False})
+
+        async def run():
+            async with _client(handler) as c:
+                await c.search("oneway", {})
+
+        with pytest.raises(LambdaError) as exc:
+            asyncio.run(run())
+        assert not isinstance(exc.value, DegradedSearchError)
+        assert attempts["n"] == 3
 
 
 class TestSearchStatus:

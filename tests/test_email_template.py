@@ -96,8 +96,22 @@ def welcome_html() -> str:
     return _welcome_parts(DAY_CAP, MONTH_CAP, LINK)[1]
 
 
-def cap_html(branch: str) -> str:
-    return _cap_parts(branch, SIGNALS, LINK, MONTH_CAP)[2]
+#: The bracket the cap note carries when the send-time fare lookup
+#: answered. Fixed here so a snapshot diff is a copy change and never a
+#: fresh fare; in production this string is re-priced on every run and
+#: dropped entirely when the lookup fails (`src/giftfare.py`).
+GIFT = " (164$ TLV to Athens nonstop both ways, one call)"
+
+
+def cap_html(branch: str, gift_fare: str = GIFT) -> str:
+    return _cap_parts(
+        branch,
+        SIGNALS,
+        LINK,
+        MONTH_CAP,
+        day_cap=DAY_CAP,
+        gift_fare=gift_fare,
+    )[2]
 
 
 RENDERED = {
@@ -197,7 +211,9 @@ class TestTheTwoNotesSayTheRightThing:
 
     def test_the_cap_button_follows_the_tool_split(self):
         flights = cap_html(BRANCH_DAILY)
-        assert "https://flights.flightpowers.com/mcp" in flights
+        # `/connect`, never `/mcp`: the machine endpoint answers a human
+        # who clicks it in a mail client with a raw JSON 401.
+        assert "https://flights.flightpowers.com/connect" in flights
         assert "hotels.flightpowers.com" not in flights
 
         hotelish = _cap_parts(
@@ -212,26 +228,44 @@ class TestTheTwoNotesSayTheRightThing:
             ),
             LINK,
             MONTH_CAP,
+            day_cap=DAY_CAP,
+            gift_fare=GIFT,
         )[2]
-        assert "https://hotels.flightpowers.com/mcp" in hotelish
+        assert "https://hotels.flightpowers.com/connect" in hotelish
         assert "flights.flightpowers.com" not in hotelish
+        # And the round-trip fare bracket goes with the flights variant.
+        assert "nonstop both ways" not in hotelish
 
-    def test_the_two_branches_differ_only_in_the_opener(self):
+    def test_the_two_branches_differ_in_the_opener_and_the_ask(self):
         daily = cap_html(BRANCH_DAILY)
         monthly = cap_html(BRANCH_MONTHLY)
-        assert "You hit the free daily cap twice this week" in daily
+        assert "You hit the free cap today" in daily
+        assert "The cap is 150 a day" in daily
+        assert "what you were scanning when it cut out" in daily
         assert "two thirds through this month's free searches" in monthly
         assert "9 days of the month to go" in monthly
+        assert "I read every reply" in monthly
+
+    def test_the_live_fare_is_a_bracket_that_can_be_dropped(self):
+        """A fare goes stale in minutes, so no-answer means no sentence."""
+        with_fare = cap_html(BRANCH_DAILY)
+        without = cap_html(BRANCH_DAILY, "")
+        assert "164$ TLV to Athens nonstop both ways, one call" in with_fare
+        assert "nonstop both ways" not in without
+        # And the sentence it sits in survives the drop intact.
+        assert "a round trip counts as one request there." in without
 
     def test_a_count_we_do_not_have_drops_the_hero_rather_than_printing_zero(self):
         blank = CapSignals(
             cap_days_7=2, active_days_ever=4, days_left_in_month=9
         )
-        html = _cap_parts(BRANCH_DAILY, blank, LINK, MONTH_CAP)[2]
+        html = _cap_parts(
+            BRANCH_DAILY, blank, LINK, MONTH_CAP, day_cap=DAY_CAP, gift_fare=GIFT
+        )[2]
         assert ">0</div>" not in html
         assert "free searches this month" not in html
         # And the rest of the note is intact.
-        assert "I read every reply" in html
+        assert "what you were scanning when it cut out" in html
         assert tpl.problems(html, unsubscribe_url=LINK) == []
 
     def test_the_text_twin_is_the_sequence_files_copy_not_the_html_flow(self):

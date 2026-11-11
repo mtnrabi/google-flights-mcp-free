@@ -47,7 +47,7 @@ import logging
 import os
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlencode
 
@@ -199,6 +199,26 @@ class GoogleWebAuth:
     client_secret: str
     redirect_uri: str
     session_secret: bytes
+
+    # ── the same sign-in, on another hostname ────────────────────────────
+
+    def for_origin(self, origin: str) -> "GoogleWebAuth":
+        """This sign-in with the callback moved to `origin`.
+
+        One deployment answers on more than one hostname (see
+        `settings.public_url_aliases`), and Google compares `redirect_uri`
+        byte-for-byte: a user who started the flow on the alias must be sent
+        back to the alias, or Google refuses with `redirect_uri_mismatch`.
+        Both callback URLs are registered in the Cloud Console.
+
+        `session_secret` is deliberately shared: it is derived from the
+        Google client secret, not from the host, and the session cookie is
+        already scoped per host by the browser.
+        """
+        want = f"{origin.rstrip('/')}/connect/callback"
+        if want == self.redirect_uri:
+            return self
+        return replace(self, redirect_uri=want)
 
     # ── step 1: send them to Google ──────────────────────────────────────
 

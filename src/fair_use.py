@@ -20,12 +20,13 @@ uncapped.
 
 The numbers, and why they are these numbers
 -------------------------------------------
-150 backend calls per UTC day and 2,000 per calendar month, decided by mrabi
-on 2026-09-05. The month cap is the one doing the real work: 150 a day for a
-whole month would be 4,500, and RapidAPI PRO is 2,500 requests for $10. Free
-must not be a better deal than the cheapest paid plan, so the month cap sits
-below it. Enforced from day one rather than after a monitor period, because
-the traffic that prompted it is already running daily.
+50 backend calls per UTC day and 250 per calendar month (lowered from
+150/2,000 by mrabi on 2026-09-15; the original 150/2,000 pair was decided
+2026-09-05). The month cap is the one doing the real work: even at 50 a day
+for a whole month (1,500) it stays well under RapidAPI PRO's 2,500 requests
+for $10. Free must not be a better deal than the cheapest paid plan, so the
+month cap sits below it. Enforced from day one rather than after a monitor
+period, because the traffic that prompted it is already running daily.
 
 The client key
 --------------
@@ -48,7 +49,7 @@ That key has one failure mode that is worse than being weak, and it is the
 opposite failure: it can be too STRONG. A remote gateway terminates the
 end user's connection and opens its own to us, so every user behind it
 arrives with the same forwarded IP and the same user agent -- one key, one
-150-a-day allowance, shared. Claude.ai's connector fetcher egresses from
+50-a-day allowance, shared. Claude.ai's connector fetcher egresses from
 160.79.104.0/21 for every Claude user on earth; Smithery's gateway proxies
 every install of this server through its own infrastructure. Under the
 2026-09-05 key, a handful of real chat users behind one gateway would have
@@ -102,8 +103,9 @@ So the key is chosen per request, and which way it was chosen is recorded:
                   rather than pretending. One shared counter for everyone
                   behind that gateway, at the higher gateway caps.
 
-  direct          Everything else, including the batch client. Unchanged
-                  from 2026-09-05: IP + user agent, 150/day, 2,000/month.
+  direct          Everything else, including the batch client. IP + user
+                  agent, 50/day, 250/month since 2026-09-15 (150/day,
+                  2,000/month from 2026-09-05 to 2026-09-15).
 
 The same narrowness cuts the other way: because a caller can start a new
 session whenever it likes, `gateway_session` is escapable by re-initialising.
@@ -245,8 +247,8 @@ WARN_AT = 0.8
 # the two MCP endpoints are the ones in CLAUDE.md's asset table, and the plan
 # names and prices come from the RapidAPI listings' own billingPlans payload
 # (state/gtm/PASTE-long-descriptions-2026-09-04.md, verified 2026-09-04):
-# flights BASIC $0 / 10 requests a month, PRO $10 / 2,500; hotels BASIC $0 /
-# 10, PRO $10 / 2,000. Nothing here is estimated or rounded.
+# flights BASIC $0 / 50 requests a month (10 until 2026-11-08), PRO $10 / 2,500;
+# hotels BASIC $0 / 10, PRO $10 / 2,000. Nothing here is estimated or rounded.
 
 # The keyed endpoints. `flights.flightpowers.com` and
 # `google-flights-mcp.flightpowers.com` are the same deployment (#415, host
@@ -263,6 +265,31 @@ PAID_HOTELS_URL = "https://hotels.flightpowers.com/mcp"
 SIGNIN_FLIGHTS_URL = "https://flights.flightpowers.com/mcp/oauth"
 SIGNIN_HOTELS_URL = "https://hotels.flightpowers.com/mcp/oauth"
 
+# The paid server's own keyless allowance, as production is configured today:
+# `GET https://flights.flightpowers.com/health` reports `trial_enabled: true`
+# and `trial_day_cap: 10`, and its tool descriptions carry the same number
+# (`mcp_server_paid/src/trial.py::trial_tail`). Repeated here rather than
+# fetched: a cap message on THIS server must not depend on that one being
+# reachable. If the paid cap ever changes, this constant is the one line to
+# change here and `/health` is the source of truth.
+PAID_TRIAL_DAY_CAP = 10
+
+
+def paid_trial_line() -> str:
+    """One sentence: a key is not the first step on the paid server either.
+
+    Every place this server points a capped caller at the paid one used to end
+    at "paste your RapidAPI key", which is homework at the exact moment the
+    caller wanted an answer instead. Since 2026-09-20 a signed-in account gets
+    `PAID_TRIAL_DAY_CAP` ad-free searches a day there with nothing to paste, so
+    the sentence that names the paid server says so too.
+    """
+    return (
+        "You do not need a key to try it: sign in with Google there and the "
+        f"first {PAID_TRIAL_DAY_CAP} searches each day are free and ad-free "
+        "on our key, with nothing to paste."
+    )
+
 # The free server's own two URLs. `/mcp` is the one we market (Matan,
 # 2026-09-09): it serves anonymous callers under the taster cap and offers
 # sign-in through the RFC 9728 metadata, so a client set to "authorization
@@ -271,6 +298,16 @@ SIGNIN_HOTELS_URL = "https://hotels.flightpowers.com/mcp/oauth"
 # clients that fix the auth mode when a server is ADDED and cannot act on a
 # 401 that arrives later (ChatGPT connectors, Claude's connector UI saved
 # with auth "None").
+#
+# The hostname is `free-trial.flightpowers.com` from 2026-09-15 (Matan: "keep
+# the old one for old users, but update everywhere for the new one"). The old
+# `google-flights-lulu.flightpowers.com` still serves every request end to
+# end -- it is an alias of the same deployment, listed in
+# `MCP_PUBLIC_URL_ALIASES`, and `OAuthSupport.for_host` keeps its issuer, its
+# callback and its widget domain self-consistent. These two constants are
+# TEXT A PERSON READS (the 401 directions, the cap message), and text names
+# the new hostname, so an old user learns it rather than having it kept from
+# them. Nothing is compared against them.
 FREE_MCP_URL = "https://free-trial.flightpowers.com/mcp"
 FREE_SIGNIN_URL = "https://free-trial.flightpowers.com/mcp/oauth"
 
@@ -341,7 +378,8 @@ def anon_directions(anon_day_cap: int, signed_in_day_cap: int,
         f"offer a Sign in button for this server, and if it does not, add "
         f"{FREE_SIGNIN_URL} instead, which asks for the sign-in up front. Or "
         f"use your own RapidAPI key on the paid, ad-free server: "
-        f"{PAID_FLIGHTS_URL} for flights, {PAID_HOTELS_URL} for hotels."
+        f"{PAID_FLIGHTS_URL} for flights, {PAID_HOTELS_URL} for hotels. "
+        + paid_trial_line()
     )
 
 
@@ -358,16 +396,19 @@ def upgrade_steps() -> list[str]:
         (
             "1. Get a RapidAPI key: subscribe at "
             f"{FLIGHTS_LISTING_URL} for flights, or "
-            f"{HOTELS_LISTING_URL} for hotels. BASIC is free and includes 10 "
-            "requests a month; PRO is $10 a month (2,500 requests on flights, "
+            f"{HOTELS_LISTING_URL} for hotels. BASIC is free and includes 50 "
+            "requests a month on flights, 10 on hotels; PRO is $10 a month (2,500 requests on flights, "
             "2,000 on hotels)."
         ),
         (
             "2. Point your MCP client at the paid server. Sign in, nothing to "
             f"paste into your client: {SIGNIN_FLIGHTS_URL} for flights, "
             f"{SIGNIN_HOTELS_URL} for hotels. The client shows a Sign in "
-            "button, you sign in with Google, and you paste the key once on "
-            "the page it opens. Or bring your own key: "
+            "button and you sign in with Google. You can skip step 1 to "
+            f"start: the first {PAID_TRIAL_DAY_CAP} searches each day are free "
+            "and ad-free on our key, and you paste your own key once on the "
+            "/connect page it opens when you want that cap gone. Or bring "
+            "your own key: "
             f"{PAID_FLIGHTS_URL} for flights, {PAID_HOTELS_URL} for hotels, "
             "passed any one of three ways, first non-empty wins: an "
             "`x-rapidapi-key` header (preferred), `?rapidapi_key=YOUR_KEY` on "
@@ -475,8 +516,12 @@ def upgrade_tail(
         "help. Beyond the free allowance, the same tools run ad-free on the "
         f"paid server against your own RapidAPI plan: subscribe at "
         f"{FLIGHTS_LISTING_URL} for flights or {HOTELS_LISTING_URL} for "
-        "hotels (BASIC is free with 10 requests a month, PRO is $10 a month), "
-        f"then sign in at {SIGNIN_FLIGHTS_URL} / {SIGNIN_HOTELS_URL}, or pass "
+        "hotels (BASIC is free with 50 requests a month on flights, 10 on "
+        "hotels, PRO is $10 a month), "
+        f"then sign in at {SIGNIN_FLIGHTS_URL} / {SIGNIN_HOTELS_URL}. A key is "
+        f"not the first step there: sign in and the first {PAID_TRIAL_DAY_CAP} "
+        "searches each day are free and ad-free on our key, with nothing to "
+        "paste. Or pass "
         f"the key yourself to {PAID_FLIGHTS_URL} / {PAID_HOTELS_URL} in an "
         "`x-rapidapi-key` header or as `?rapidapi_key=` on the URL. When a "
         "result carries a `fair_use` field, mention the upgrade path briefly, "
@@ -744,7 +789,8 @@ def caps_for(
     now IS:
 
     * **signed in** gets the real allowance -- `day_cap`/`month_cap`, the
-      150/2,000 pair -- counted against one Google account. Gateway pooling
+      50/250 pair since 2026-09-15 (150/2,000 before it) -- counted
+      against one Google account. Gateway pooling
       does not apply to it: there is nothing to pool, the key is a person.
     * **anonymous** gets the taster pair. One number, deliberately small,
       because the anonymous endpoint is now a way to try the server rather
@@ -1014,7 +1060,10 @@ def rate_limited_result(state: FairUseState) -> dict[str, Any]:
             "The same tools run without ads and without this cap on the paid "
             "server, billed to your own RapidAPI key. Quickest way in is a "
             f"sign-in, nothing to paste into your client: {SIGNIN_FLIGHTS_URL} "
-            f"for flights, {SIGNIN_HOTELS_URL} for hotels. Or bring your own "
+            f"for flights, {SIGNIN_HOTELS_URL} for hotels -- and the first "
+            f"{PAID_TRIAL_DAY_CAP} searches each day there are free and "
+            "ad-free on our key before any of it is billed to you. Or bring "
+            "your own "
             f"key: {PAID_FLIGHTS_URL} for flights, {PAID_HOTELS_URL} for "
             "hotels, with the key in an `x-rapidapi-key` header."
         )
@@ -1116,7 +1165,8 @@ def hard_block_message(retry_after: int, day_cap: int) -> str:
     """
     return (
         f"Free fair-use reached ({day_cap:,} searches/day). "
-        f"Retry after {retry_after}s, or use the paid server (BASIC is free): "
+        f"Retry after {retry_after}s, or use the paid server "
+        f"({PAID_TRIAL_DAY_CAP} free ad-free searches a day, no key): "
         f"sign in at {SIGNIN_FLIGHTS_URL}, or bring your own RapidAPI key at "
         f"{PAID_FLIGHTS_URL}, "
         f"details: {DOCS_URL_HARD}"

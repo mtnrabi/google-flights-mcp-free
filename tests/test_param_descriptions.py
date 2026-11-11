@@ -96,6 +96,23 @@ class TestParameterDescriptions:
         assert "\n" not in checkout["description"]
         assert "Must be after checkin_date" in checkout["description"]
 
+    @pytest.mark.parametrize(
+        "name", ["search_oneway_flights", "search_roundtrip_flights"]
+    )
+    def test_passengers_is_one_code_per_traveller(self, monkeypatch, tmp_path, name):
+        """The backend reads `passengers` as one code per traveller and, since
+        flight_rabbi #511, answers 422 to a 0 or to a party with no adult.
+        Until 2026-09-26 this text said "counts as [adults, children,
+        infants]", so a model following it sent [1, 0, 0] for one adult."""
+        tools = tools_for(monkeypatch, tmp_path, False)
+        tool = next(t for t in tools if t["name"] == name)
+        text = tool["inputSchema"]["properties"]["passengers"]["description"]
+        for fragment in ("One entry per traveller", "not a count", "1 adult",
+                         "2 child", "3 infant on lap", "4 infant in seat",
+                         "[1, 1, 2]", "At least one adult", "Omit for one adult"):
+            assert fragment in text, (fragment, text)
+        assert "counts as" not in text
+
     def test_use_fallback_keeps_its_explicit_field_text(
         self, monkeypatch, tmp_path
     ):

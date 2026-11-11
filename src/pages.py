@@ -3,8 +3,8 @@ The two-page HTML shell the sign-in flow needs, and nothing else.
 
 The paid server renders its pages through `src/legal.py`, which also carries
 the privacy policy and the terms. This server has no legal module -- its
-policy pages live on flightpowers.com -- so the shell is here, cut down to
-what `/connect` and the consent page use. Copied in shape from
+terms live on flightpowers.com, its privacy page is src/privacy.py -- so the shell is here, cut down to
+what `/connect`, the consent page and `/privacy` use. Copied in shape from
 `mcp_server_paid/src/legal.py` (`_STYLE`, `page`) and
 `mcp_server_paid/src/connect.py` (`_EXTRA_STYLE`) rather than imported: the
 two directories are deployed separately on Vercel, each upload is rooted at
@@ -17,11 +17,14 @@ from __future__ import annotations
 import html
 from typing import Any
 
-CONTACT_EMAIL = "mtnrabi@gmail.com"
+CONTACT_EMAIL = "matan@flightpowers.com"
 
-#: Where the free server's policy documents live. They are on the marketing
-#: site rather than on this deployment, so they are absolute URLs.
-PRIVACY_URL = "https://flightpowers.com/privacy"
+#: Where the free server's policy documents live. The privacy page is served
+#: by this deployment (`/privacy`, src/privacy.py) since 2026-10-22: the site's
+#: page did not describe the sign-ins, counters, emails, Lulu or Stay22. Absolute
+#: and canonical, because the OAuth metadata (`resource_policy_uri`,
+#: `op_policy_uri`) must be a full URL. The terms still live on the site.
+PRIVACY_URL = "https://free-trial.flightpowers.com/privacy"
 TERMS_URL = "https://flightpowers.com/terms"
 
 _STYLE = """
@@ -59,11 +62,13 @@ def e(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
-def page(title: str, body_html: str) -> str:
+def page(title: str, body_html: str, *, extra_style: str = "") -> str:
+    """The shell. `extra_style` is appended to the shared stylesheet, for a
+    page that needs one or two rules of its own (src/landing.py)."""
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f"<title>{html.escape(title)}</title><style>{_STYLE}</style></head>"
+        f"<title>{html.escape(title)}</title><style>{_STYLE}{extra_style}</style></head>"
         f"<body>{body_html}</body></html>"
     )
 

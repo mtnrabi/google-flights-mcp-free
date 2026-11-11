@@ -396,7 +396,7 @@ class TestTheBlockShape:
         # Plan names and prices, checked against the live billingPlans payload
         # in state/gtm/PASTE-long-descriptions-2026-09-04.md. Rule 1: no
         # number in outward copy that is not traceable to something live.
-        assert "BASIC is free and includes 10 requests a month" in how[0]
+        assert "BASIC is free and includes 50 requests a month on flights, 10 on hotels" in how[0]
         assert "$10 a month" in how[0]
         assert "x-rapidapi-key" in how[1] and "rapidapi_key=" in how[1]
         assert PAID_FLIGHTS_URL in how[1] and PAID_HOTELS_URL in how[1]

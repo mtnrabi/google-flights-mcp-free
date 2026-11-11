@@ -594,10 +594,15 @@ class TestTheCapNoteSend:
         assert body["headers"]["List-Unsubscribe"] == f"<{link}>"
         # Hotels, because that is what this account searched -- and exactly
         # one product URL, never both.
-        assert "https://hotels.flightpowers.com/mcp" in body["text"]
+        # `/connect`, never `/mcp`: a human who clicks the machine endpoint
+        # in a mail client gets a raw JSON 401 (pass 9, 2026-09-11).
+        assert "https://hotels.flightpowers.com/connect" in body["text"]
         assert "flights.flightpowers.com" not in body["text"]
-        assert "2,000 requests" in body["text"]
-        assert "You hit the free daily cap twice this week" in body["text"]
+        assert "PRO is 10$ for 2,000" in body["text"]
+        assert "You hit the free cap today" in body["text"]
+        # Hotels drops the round-trip fare bracket: a flight price in a
+        # hotels note is a non sequitur.
+        assert "nonstop both ways" not in body["text"]
         for part in (body["text"], body["html"]):
             assert link in part
             assert "RESEND_UNSUBSCRIBE_URL" not in part
@@ -624,8 +629,8 @@ class TestTheCapNoteSend:
         body = resend.sends[0]
         assert body["subject"] == "more room on your routes"
         assert "two thirds through this month's free searches" in body["text"]
-        assert "https://flights.flightpowers.com/mcp" in body["text"]
-        assert "2,500 requests" in body["text"]
+        assert "https://flights.flightpowers.com/connect" in body["text"]
+        assert "PRO is 10$ for 2,500" in body["text"]
 
     @pytest.mark.asyncio
     async def test_nothing_here_can_raise(self):

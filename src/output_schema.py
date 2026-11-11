@@ -85,7 +85,8 @@ SEARCH_STATUS_DESCRIPTION = (
     "some combinations returned results and some failed, so the list is "
     "incomplete. 'degraded': every combination failed, so the search did not "
     "happen and an empty list means nothing; this case is also flagged with "
-    "isError: true and is safe to retry."
+    "isError: true. Whether repeating it can help is the backend's call, in "
+    "`retry` when it made one: false means the same call will fail again."
 )
 
 _RESULT_ROWS: dict[str, Any] = {
@@ -105,6 +106,51 @@ _RESULT_ROWS: dict[str, Any] = {
         "`link` -- that is the one to open."
     ),
     "items": {"type": "object", "additionalProperties": True},
+}
+
+#: The flights version: the same pass-through rows, plus what a caller needs
+#: to read a fare without guessing (asked on the public repo,
+#: google-flights-mcp-free #3). Nothing here is new data; it says what the
+#: backend's fields already mean.
+_FLIGHT_RESULT_ROWS: dict[str, Any] = {
+    **_RESULT_ROWS,
+    "description": (
+        _RESULT_ROWS["description"]
+        + "\n\nPrice basis: `price_as_number` (one-way) and "
+        "`total_price_as_number` (round trip) are the fare for the WHOLE "
+        "party in `passengers`, as Google Flights prices it, not per "
+        "traveller. They are in the `currency` the request asked for; "
+        "`price` / `total_price` is the same amount as Google printed it, "
+        "with its currency symbol.\n\n"
+        "On one-way rows `segments` lists the itinerary's flights in order, "
+        "one object per flight: from_airport, to_airport (IATA), "
+        "airline_code, flight_number and departure_date (local, "
+        "YYYY-MM-DD). It is [] when the segments could not be read. "
+        "Per-flight clock times are not published: "
+        "`departure_description` / `arrival_description` are the whole "
+        "itinerary's local departure and arrival as display text, and "
+        "`stops_info` gives each connection's airport and layover length."
+    ),
+}
+
+#: The hotels version: the same rows, with the two coordinate fields
+#: declared so a client reading the schema knows they exist. Not required: an
+#: older backend row without them is still a valid row.
+_HOTEL_RESULT_ROWS: dict[str, Any] = {
+    **_RESULT_ROWS,
+    "description": (
+        _RESULT_ROWS["description"]
+        + "\n\nlatitude and longitude are the property's WGS84 coordinates "
+        "in decimal degrees, from Booking.com, null when Booking publishes none."
+    ),
+    "items": {
+        "type": "object",
+        "properties": {
+            "latitude": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "longitude": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+        },
+        "additionalProperties": True,
+    },
 }
 
 _SPONSORED: dict[str, Any] = {
@@ -240,7 +286,7 @@ FLIGHTS_OUTPUT_SCHEMA: dict[str, Any] = {
         "an empty array means 'no flights' only when search_status is 'empty'."
     ),
     "properties": {
-        "results": _RESULT_ROWS,
+        "results": _FLIGHT_RESULT_ROWS,
         "result_count": {"type": "integer", "minimum": 0},
         "by_destination": _BY_DESTINATION,
         "search_status": {
@@ -294,7 +340,9 @@ FLIGHTS_OUTPUT_SCHEMA: dict[str, Any] = {
             "description": (
                 "Whether repeating this exact call could succeed. Present and "
                 "false on a rate_limited result, where the allowance, not the "
-                "request, is what failed."
+                "request, is what failed. On a degraded search, the backend's "
+                "own verdict when it gave one: false means do not repeat it "
+                "unchanged."
             ),
         },
         "fair_use": {
@@ -316,8 +364,8 @@ FLIGHTS_OUTPUT_SCHEMA: dict[str, Any] = {
                     "type": "string",
                     "description": (
                         "One-line, chat-host-renderable summary of the caps "
-                        "and today's usage, e.g. \"Free tier: 150 searches a "
-                        "day, 2,000 a month; 120 used today.\""
+                        "and today's usage, e.g. \"Free tier: 50 searches a "
+                        "day, 250 a month; 20 used today.\""
                     ),
                 },
                 "note": {"type": "string"},
@@ -362,7 +410,7 @@ HOTELS_OUTPUT_SCHEMA: dict[str, Any] = {
         "header, so these results carry no search_status field."
     ),
     "properties": {
-        "results": _RESULT_ROWS,
+        "results": _HOTEL_RESULT_ROWS,
         "result_count": {"type": "integer", "minimum": 0},
         "search_coverage": {
             "type": "object",
@@ -417,8 +465,8 @@ HOTELS_OUTPUT_SCHEMA: dict[str, Any] = {
                     "type": "string",
                     "description": (
                         "One-line, chat-host-renderable summary of the caps "
-                        "and today's usage, e.g. \"Free tier: 150 searches a "
-                        "day, 2,000 a month; 120 used today.\""
+                        "and today's usage, e.g. \"Free tier: 50 searches a "
+                        "day, 250 a month; 20 used today.\""
                     ),
                 },
                 "note": {"type": "string"},

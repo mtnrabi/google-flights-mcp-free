@@ -34,7 +34,6 @@ that `/mcp` serves.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Any
@@ -72,6 +71,7 @@ from .ratelimit import (
     client_ip,
     usable_address,
 )
+from .tasks import spawn_and_wait
 from .webauth import (
     COOKIE_PATH,
     OAUTH_COOKIE,
@@ -82,6 +82,17 @@ from .webauth import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: How long the sign-in redirect is allowed to wait for the welcome note.
+#: The hand-off used to be pure fire-and-forget, which on a serverless
+#: instance means "runs only if the instance happens not to be frozen
+#: yet" -- and three of nine real sign-ins between 2026-09-13 and 09-16
+#: got no welcome because of it. Two and a half seconds is inside what a
+#: person perceives as the redirect they just triggered, and it is longer
+#: than a healthy Resend `POST /emails` takes. A slower one is not lost:
+#: the task keeps running (`spawn_and_wait` shields it) and the daily
+#: `welcome` retry picks up anything that still did not land.
+HAND_OFF_TIMEOUT = 2.5
 
 #: Metadata is public, immutable per deployment, and polled by every client
 #: on every connect. Five minutes of caching is the difference between a cold
@@ -253,9 +264,24 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
     """
 
     site_origin = oauth.issuer
+    # The URL PRINTED on the account pages. Canonical on purpose, even for a
+    # visitor who arrived on an alias hostname: it is the name we want people
+    # to learn and to paste into a new client (Matan, 2026-09-15 -- "keep the
+    # old one for old users, but update everywhere for the new one").
     sign_in_url = f"{site_origin}{MCP_OAUTH_PATH}"
     _cookie_secure = site_origin.lower().startswith("https://")
-    _canonical_host = site_origin.split("://", 1)[-1].rstrip("/").lower()
+
+    def _here(request: Request) -> OAuthSupport:
+        """The OAuthSupport for the hostname this request arrived on.
+
+        Everything a CLIENT compares byte-for-byte -- issuer, endpoints,
+        `resource_metadata`, the Google `redirect_uri` -- comes off this
+        object, so an alias hostname stays self-consistent instead of
+        half-redirecting to the canonical one. Everything a PERSON reads
+        still comes off the canonical `oauth`.
+        """
+        return oauth.for_host(request.headers.get("host") or "")
+
     day_cap = getattr(settings, "fair_use_day_cap", 0)
     month_cap = getattr(settings, "fair_use_month_cap", 0)
     def _anon_day_cap() -> int:
@@ -291,17 +317,25 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
         )
 
     def _wrong_host(request: Request, keep_query: bool = False) -> Response | None:
-        """Send an alias hostname to the canonical origin before anything is set.
+        """Send an UNKNOWN hostname to the canonical origin before anything is set.
 
         The session cookie is per host and Google compares `redirect_uri`
-        literally, so a sign-in started on an alias would set its state
-        cookie there, come back to the canonical host, find no cookie and
-        fail with a message that reads like a Google misconfiguration. One
-        302 up front removes the whole class -- and it is why only one
-        redirect URI has to be registered in the Cloud Console.
+        literally, so a sign-in started on a host whose callback URL is not
+        registered would set its state cookie there and then fail with a
+        message that reads like a Google misconfiguration. One 302 up front
+        removes the whole class.
+
+        A hostname we PUBLISH is not wrong (2026-09-15). Both
+        `free-trial.flightpowers.com` and the older
+        `google-flights-lulu.flightpowers.com` serve themselves end to end,
+        with their own `/connect/callback` registered in the Cloud Console --
+        bouncing a signed-in user off the host their connector uses is how an
+        old client ends up holding a token for an issuer it never asked
+        about. Anything else (a preview URL, a hostname merely pointed at us)
+        still gets the redirect.
         """
-        host = (request.headers.get("host") or "").strip().lower()
-        if not host or host == _canonical_host:
+        host = (request.headers.get("host") or "").strip()
+        if not host or oauth.knows_host(host):
             return None
         query = request.url.query
         target = f"{site_origin}{request.url.path}" + (
@@ -310,6 +344,13 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
         return RedirectResponse(target, status_code=302)
 
     def _identity(request: Request):
+        """Who is signed in, on either hostname.
+
+        `oauth`, not `_here`: the session secret is derived from the Google
+        client secret and not from the host (see `GoogleWebAuth.for_origin`),
+        so one cookie reads the same on both. Only the `redirect_uri` is per
+        host, which is what `_here(request).auth` is for.
+        """
         return oauth.auth.read_session(request.cookies.get(SESSION_COOKIE))
 
     # ── the account page ─────────────────────────────────────────────────
@@ -349,7 +390,12 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
         # not-yet-signed-in user through here and wants them returned to the
         # pending authorization request rather than to a page that has
         # forgotten it.
-        url, state_cookie = oauth.auth.start(request.query_params.get("next", ""))
+        # `_here`, not `oauth`: the `redirect_uri` handed to Google has to be
+        # the callback on the host the user is standing on, or Google answers
+        # `redirect_uri_mismatch`. Both are registered in the Cloud Console.
+        url, state_cookie = _here(request).auth.start(
+            request.query_params.get("next", "")
+        )
         response = RedirectResponse(url, status_code=302)
         _set_cookie(response, OAUTH_COOKIE, state_cookie, OAUTH_STATE_TTL_SECONDS)
         return response
@@ -379,7 +425,10 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
                 status_code=400,
             )
         try:
-            identity = await oauth.auth.finish(code, state, state_cookie)
+            # Same host as `/connect/start`: the token exchange re-sends the
+            # `redirect_uri` and Google checks it against the one the code
+            # was issued for.
+            identity = await _here(request).auth.finish(code, state, state_cookie)
         except WebAuthError as exc:
             logger.info("sign-in rejected: %s", exc)
             return HTMLResponse(
@@ -410,9 +459,14 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
 
         Both halves are best effort and neither can fail the sign-in: a
         marketing list is not a reason to refuse somebody a login. The
-        Resend call runs as a background task so the redirect is not waiting
-        on it, and `freeusers.upsert` reports `True` only for the INSERT, so
-        the hand-off fires once per account even when two sign-ins race.
+        hand-off is AWAITED, with a `HAND_OFF_TIMEOUT` ceiling, because a
+        task created after the response returns only runs if the instance
+        has not been frozen yet -- which is how the welcome went missing
+        for a third of the sign-ins in September. Past the ceiling the
+        task keeps running and the redirect goes out anyway; nothing here
+        can make a person wait longer than that or fail their sign-in.
+        `freeusers.upsert` reports `True` only for the INSERT, so the
+        hand-off fires once per account even when two sign-ins race.
         """
         if oauth.users is None:
             return
@@ -445,10 +499,12 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
             except Exception as exc:  # noqa: BLE001 - best effort by construction
                 logger.warning("mailing-list hand-off failed: %s", exc)
 
-        try:
-            asyncio.create_task(hand_off())
-        except RuntimeError:  # pragma: no cover - no running loop, e.g. a test
-            logger.debug("no event loop for the Resend hand-off; skipped")
+        # Waited on, not fired and forgotten -- and the task is strongly
+        # referenced either way, because `asyncio` keeps only a weak
+        # reference to a bare task and can collect it mid-await.
+        await spawn_and_wait(
+            hand_off(), timeout=HAND_OFF_TIMEOUT, label="sign-in mail hand-off"
+        )
 
     @mcp.custom_route("/connect/delete", methods=["POST"])
     async def connect_delete(request: Request) -> Response:
@@ -563,10 +619,10 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
         discovery on either path is spendable on both.
         """
 
-        async def handler(_request: Request) -> Response:
+        async def handler(request: Request) -> Response:
             return JSONResponse(
-                oauth.protected_resource_metadata(path),
-                headers={"Cache-Control": _METADATA_CACHE},
+                _here(request).protected_resource_metadata(path),
+                headers={"Cache-Control": _METADATA_CACHE, "Vary": "Host"},
             )
 
         # Starlette names a route after the function; three closures all
@@ -574,10 +630,14 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
         handler.__name__ = "protected_resource" + path.replace("/", "_")
         return handler
 
-    async def _authorization_server(_request: Request) -> Response:
+    async def _authorization_server(request: Request) -> Response:
+        # `Vary: Host` because the body IS the host: issuer, authorization,
+        # token, registration and revocation endpoints all carry it, and a
+        # cache that served one hostname's document to the other would point
+        # a client at an issuer it never connected to.
         return JSONResponse(
-            oauth.authorization_server_metadata(),
-            headers={"Cache-Control": _METADATA_CACHE},
+            _here(request).authorization_server_metadata(),
+            headers={"Cache-Control": _METADATA_CACHE, "Vary": "Host"},
         )
 
     # Both the bare and the path-scoped form. RFC 9728 3.1 says a client
@@ -680,7 +740,7 @@ def register_oauth_routes(mcp, oauth: OAuthSupport, settings) -> None:
                     429,
                 )
         try:
-            client, validated = await oauth.read_authorize_request(params)
+            client, validated = await _here(request).read_authorize_request(params)
         except OAuthError as exc:
             if not exc.redirectable:
                 return _error_page(

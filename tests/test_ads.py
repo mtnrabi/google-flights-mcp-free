@@ -519,3 +519,86 @@ class TestResultWidget:
         async with Client(server) as client:
             uris = {str(r.uri) for r in await client.list_resources()}
         assert not [u for u in uris if u.startswith("ui://lulu-ads/")]
+
+
+class TestPublicUrlIsTheConnectorUrl:
+    """Regression cover for the 2026-09-15 claude.ai incident.
+
+    `MCP_PUBLIC_URL` was the bare origin on Vercel. Lulu hashes that exact
+    string into `_meta.ui.domain`; claude.ai recomputes it from the connector
+    URL the user added, which ends in `/mcp`. They disagreed, claude.ai
+    refused the widget on every successful search ("Unable to reach
+    FlightPowers"), and the impression beacon never fired.
+
+    The pre-existing `test_widget_domain_matches_the_public_url` could not
+    catch this: it hashed `load_settings().public_url` on both sides, so it
+    passed for any value at all. These tests derive the expected domain from
+    the ORIGIN plus the mount path instead.
+    """
+
+    ORIGIN = "https://free.test.invalid"
+
+    def test_a_bare_origin_is_given_the_mcp_path(self, monkeypatch):
+        from src.settings import MCP_MOUNT_PATH
+
+        monkeypatch.setenv("MCP_PUBLIC_URL", self.ORIGIN)
+        assert load_settings().public_url == self.ORIGIN + MCP_MOUNT_PATH
+
+    def test_a_trailing_slash_is_dropped(self, monkeypatch):
+        # ".../mcp/" hashes differently from ".../mcp", which is the same
+        # silent mismatch wearing a different hat.
+        monkeypatch.setenv("MCP_PUBLIC_URL", self.ORIGIN + "/mcp/")
+        assert load_settings().public_url == self.ORIGIN + "/mcp"
+
+    def test_an_explicit_path_is_left_alone(self, monkeypatch):
+        monkeypatch.setenv("MCP_PUBLIC_URL", self.ORIGIN + "/somewhere/else")
+        assert load_settings().public_url == self.ORIGIN + "/somewhere/else"
+
+    def test_the_origin_used_for_google_oauth_does_not_move(self, monkeypatch):
+        # build_server derives site_origin (and therefore the literal
+        # redirect_uri Google compares) with urlsplit on public_url. Adding
+        # the path must not change it.
+        from urllib.parse import urlsplit
+
+        monkeypatch.setenv("MCP_PUBLIC_URL", self.ORIGIN)
+        parts = urlsplit(load_settings().public_url)
+        assert f"{parts.scheme}://{parts.netloc}" == self.ORIGIN
+
+    @pytest.mark.asyncio
+    async def test_served_widget_domain_matches_what_claude_computes(
+        self, ads_server, tmp_path, monkeypatch
+    ):
+        # The assertion claude.ai actually makes, reimplemented here rather
+        # than borrowed from the SDK: sha256 of the connector URL, first 32
+        # hex chars, plus ".claudemcpcontent.com".
+        import hashlib
+
+        monkeypatch.setenv("LOG_PATH", str(tmp_path / "calls.jsonl"))
+        monkeypatch.setenv("ADS_ENABLED", "true")
+        monkeypatch.setenv("LULU_ADS_PUBLISHER_ID", "pub_test")
+        monkeypatch.setenv("LULU_ADS_API_KEY", "lk_test")
+        monkeypatch.setenv("LULU_ADS_BASE_URL", ads_server)
+        # Deliberately the broken shape ops had set in production.
+        monkeypatch.setenv("MCP_PUBLIC_URL", self.ORIGIN)
+
+        # The literal path, not src.settings.MCP_MOUNT_PATH: this test states
+        # the external contract, so it must not be able to agree with the
+        # code by importing the same constant.
+        connector_url = self.ORIGIN + "/mcp"
+        expected = (
+            hashlib.sha256(connector_url.encode()).hexdigest()[:32]
+            + ".claudemcpcontent.com"
+        )
+
+        server = build_server(load_settings())
+        async with Client(server) as client:
+            resources = {str(r.uri): r for r in await client.list_resources()}
+
+        widget_uris = [u for u in resources if u.startswith("ui://lulu-ads/")]
+        assert widget_uris, "no widgets registered -- nothing to validate"
+        for uri in widget_uris:
+            meta = resources[uri].meta or {}
+            assert meta["ui"]["domain"] == expected, (
+                f"{uri}: claude.ai would reject this widget. It validates "
+                f"ui.domain against the connector URL {connector_url}."
+            )

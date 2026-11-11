@@ -54,6 +54,7 @@ What it deliberately does not do
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from typing import Any, Awaitable, Callable, Iterable, Mapping
@@ -85,6 +86,14 @@ logger = logging.getLogger(__name__)
 JSONRPC_AUTH_REQUIRED = -32003
 
 
+def _host_of(scope: Mapping[str, Any]) -> str:
+    """The request's `Host` header, or "" when there is not one."""
+    for name, value in scope.get("headers") or []:
+        if name.decode("latin-1").lower() == "host":
+            return value.decode("latin-1").strip()
+    return ""
+
+
 class AnonCapMiddleware:
     """Pure-ASGI. Answers 401 to an anonymous caller past the taster cap.
 
@@ -101,20 +110,28 @@ class AnonCapMiddleware:
         settings: Any,
         telemetry: Any,
         classifier: Any,
-        challenge: Callable[[], str] | None = None,
+        challenge: Callable[..., str] | None = None,
         path: str = DEFAULT_MCP_PATH,
     ) -> None:
         self.app = app
         self._settings = settings
         self._telemetry = telemetry
         self._classifier = classifier
-        #: Produces the `WWW-Authenticate` value. A callable because the
-        #: OAuthSupport that knows the metadata URL is built after the app in
-        #: some orders, and because a deployment with no sign-in configured
-        #: has no challenge to send -- in which case this gate does nothing
-        #: at all and the tool layer's 200 refusal is the only behaviour,
-        #: exactly as before.
+        #: Produces the `WWW-Authenticate` value for one request. A callable
+        #: because the OAuthSupport that knows the metadata URL is built
+        #: after the app in some orders, and because a deployment with no
+        #: sign-in configured has no challenge to send -- in which case this
+        #: gate does nothing at all and the tool layer's 200 refusal is the
+        #: only behaviour, exactly as before.
+        #:
+        #: It takes the request `Host`, because the `resource_metadata` URL
+        #: it embeds is per hostname (2026-09-15) and a client follows that
+        #: URL literally. `anon_cap_middleware` passes a callable that
+        #: resolves the host; a test may pass a plain zero-argument one, so
+        #: `_challenge_for` tries the host and falls back.
         self._challenge = challenge
+        #: Cached answer from `_wants_host`; None until the first challenge.
+        self._challenge_takes_host: bool | None = None
         self._path = path.rstrip("/") or "/"
 
     @property
@@ -130,7 +147,35 @@ class AnonCapMiddleware:
             return False
         if self._challenge is None:
             return False
-        return bool(self._challenge())
+        return bool(self._challenge_for(""))
+
+    def _wants_host(self) -> bool:
+        """Whether `self._challenge` takes a `host` keyword.
+
+        Decided ONCE, by reading the signature, and cached. It used to be a
+        `try: f(host=...) except TypeError: f()`, which is wrong in a way
+        that only shows up when it matters: a TypeError raised INSIDE the
+        callable is indistinguishable from a bad signature, so a genuine bug
+        was swallowed and the callable was then invoked a second time.
+        """
+        if self._challenge_takes_host is None:
+            try:
+                inspect.signature(self._challenge).bind(host="")
+            except TypeError:
+                self._challenge_takes_host = False
+            else:
+                self._challenge_takes_host = True
+        return self._challenge_takes_host
+
+    def _challenge_for(self, host: str) -> str:
+        """The `WWW-Authenticate` value for a caller on this hostname.
+
+        A zero-argument callable is still accepted -- several tests build one
+        -- and it simply gets no host.
+        """
+        if self._challenge is None:
+            return ""
+        return self._challenge(host=host) if self._wants_host() else self._challenge()
 
     def _applies(self, scope: Mapping[str, Any]) -> bool:
         if scope.get("type") != "http":
@@ -234,7 +279,7 @@ class AnonCapMiddleware:
             return
 
         logger.info("%s", log_line(state, "anon_challenge"))
-        await _send_401(send, state, self._challenge())
+        await _send_401(send, state, self._challenge_for(_host_of(scope)))
 
 
 def _body(state: FairUseState) -> dict[str, Any]:
@@ -308,6 +353,11 @@ def anon_cap_middleware(server: Any) -> Iterable[Any]:
             settings=settings,
             telemetry=server.telemetry,
             classifier=server.classifier,
-            challenge=oauth.challenge_header,
+            # Per host: the `resource_metadata` URL in the challenge names
+            # the hostname the caller connected to, and a client follows it
+            # literally. This path is only live under the
+            # `FREE_ANON_MODE=open` rollback, which is exactly when a
+            # mismatch would be hardest to notice.
+            challenge=lambda host="", **_: oauth.for_host(host).challenge_header(),
         )
     ]

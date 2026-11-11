@@ -51,11 +51,16 @@ def main() -> None:
         try:
             from lulu_ads.widget import claude_apps_domain
 
-            logger.info(
-                "sponsored widget domain for %s -> %s",
-                settings.public_url,
-                claude_apps_domain(settings.public_url),
-            )
+            # One line PER HOSTNAME. The domain is a hash of the
+            # connector URL, so a deployment answering on an alias has a
+            # second value to check after a deploy, and a log that printed
+            # only the canonical one would hide exactly half the problem.
+            for url in (settings.public_url, *settings.public_url_aliases):
+                logger.info(
+                    "sponsored widget domain for %s -> %s",
+                    url,
+                    claude_apps_domain(url),
+                )
         except Exception as exc:  # noqa: BLE001 - diagnostic only
             logger.warning("could not derive widget domain: %s", exc)
 

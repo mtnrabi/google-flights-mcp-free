@@ -68,6 +68,7 @@ from starlette.applications import Starlette  # noqa: E402
 
 from src.anon_gate import anon_cap_middleware  # noqa: E402
 from src.hard_limit import hard_limit_middleware  # noqa: E402
+from src.landing import LandingPage  # noqa: E402
 from src.oauth import OAuthResourceGate  # noqa: E402
 from src.server import build_server  # noqa: E402
 from src.settings import load_settings  # noqa: E402
@@ -87,11 +88,14 @@ if _settings.ads_enabled:
     try:
         from lulu_ads.widget import claude_apps_domain
 
-        logger.info(
-            "sponsored widget domain for %s -> %s",
-            _settings.public_url,
-            claude_apps_domain(_settings.public_url),
-        )
+        # One line per hostname this deployment answers on: the domain is a
+        # hash of the connector URL, and the alias hostname has its own.
+        for _url in (_settings.public_url, *_settings.public_url_aliases):
+            logger.info(
+                "sponsored widget domain for %s -> %s",
+                _url,
+                claude_apps_domain(_url),
+            )
     except Exception as exc:  # noqa: BLE001 - diagnostic only
         logger.warning("could not derive widget domain: %s", exc)
 
@@ -145,7 +149,18 @@ app = Starlette(lifespan=_mcp_app.lifespan)
 #     that applies to `/mcp` as well as to the `/mcp/oauth` alias: every
 #     served call on the free server belongs to a Google account.
 #     `FREE_ANON_MODE=open` is the documented rollback.
+#
+# Outside the gate, one more layer: the landing page for a PERSON. `GET /`
+# for anyone, and `/mcp` / `/mcp/oauth` only when the request is a browser
+# navigation (Accept names text/html and nothing an MCP client sends). Every
+# other request reaches the gate exactly as before, so the 401 + OAuth
+# metadata that clients and directory probes rely on is untouched. Reason:
+# the URL in every Reddit post answered a 404 / 401 to the reader's browser
+# (2026-09-28). See src/landing.py.
 app.mount(
     "/",
-    OAuthResourceGate(_mcp_app, getattr(_server, "fp_oauth", None)),
+    LandingPage(
+        OAuthResourceGate(_mcp_app, getattr(_server, "fp_oauth", None)),
+        _settings,
+    ),
 )

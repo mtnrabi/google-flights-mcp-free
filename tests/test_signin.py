@@ -366,11 +366,17 @@ class TestPerUserCaps:
     def test_the_defaults_ship_as_ten_a_day(self, monkeypatch):
         monkeypatch.delenv("FREE_ANON_DAILY_CAP", raising=False)
         monkeypatch.delenv("FREE_ANON_MONTHLY_CAP", raising=False)
+        # conftest pins these for the fair-use suite's arithmetic; the
+        # question here is what ships when nothing is set.
+        monkeypatch.delenv("FAIR_USE_DAY_CAP", raising=False)
+        monkeypatch.delenv("FAIR_USE_MONTH_CAP", raising=False)
         settings = load_settings()
         assert settings.anon_day_cap == 10
         assert settings.anon_month_cap == 0
-        assert settings.fair_use_day_cap == 150
-        assert settings.fair_use_month_cap == 2000
+        # 50/250, which is what production has enforced since 2026-09-15.
+        # A stale default is a note quoting an allowance nobody has.
+        assert settings.fair_use_day_cap == 50
+        assert settings.fair_use_month_cap == 250
         assert settings.fair_use_gateway_day_cap == 1500
 
 

@@ -33,7 +33,6 @@ Design notes that are not obvious from the code
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import time
@@ -60,14 +59,26 @@ from .status_text import (
     partial_first_line,
     serialize_payload,
 )
+from .widget_domain import HostWidgetDomainMiddleware
 from .oauth import ANON_MODE_OPEN, anon_caps, anon_mode, build_free_oauth
 from .oauthroutes import register_oauth_routes
+from .maillist import load_mail_config
+from .freeusers import (
+    SEQUENCE_LANE_DAY_CAP,
+    SIGNIN_STATS_MAX_ROWS,
+    welcome_ledger_since,
+)
+from .signinstats import build_stats
+from .sequence import KIND_DAY2 as run_sequence_default_kind
+from .sequence import KINDS as SEQUENCE_KINDS
+from .sequence import run_sequence
 from .fair_use import (
     SIGNED_IN_HEADER,
     FLIGHTS_LISTING_URL,
     HOTELS_LISTING_URL,
     PAID_FLIGHTS_URL,
     PAID_HOTELS_URL,
+    PAID_TRIAL_DAY_CAP,
     SIGNIN_FLIGHTS_URL,
     SIGNIN_HOTELS_URL,
     FairUseState,
@@ -91,6 +102,7 @@ from .fanout import (
     plan_roundtrip,
 )
 from .hotels_lambda_client import (
+    HotelsBackendDown,
     HotelsLambdaClient,
     build_hotel_by_name_payload as build_hotels_by_name_payload,
     build_search_payload as build_hotels_search_payload,
@@ -98,6 +110,7 @@ from .hotels_lambda_client import (
 from .lambda_client import (
     SEARCH_REASON_HEADER,
     SEARCH_STATUS_HEADER,
+    DegradedSearchError,
     LambdaClient,
     # Raised by HotelsLambdaClient too, and caught in `_hotels_run`. It was
     # never imported here, so a hotels backend failure raised NameError while
@@ -119,8 +132,14 @@ from .policy import (
     extract_source_ip,
 )
 from .schema_docs import document_params
+from .passengers import (
+    is_upstream_reject,
+    normalise_passengers,
+    refusal_message,
+)
 from .settings import Settings, load_settings
 from .stores import build_counter_store
+from .tasks import spawn
 from .telemetry import CallRecord, RouteRecord, Telemetry
 
 logger = logging.getLogger(__name__)
@@ -190,6 +209,11 @@ def _missing_combinations(
     return [n for n in named if n]
 
 
+#: The last sentence of `_degraded_message`; swapped out when the backend
+#: said `retry: false` for the search (see `_degraded_failure_result`).
+_RESEND_USUALLY_SUCCEEDS = "Running the same search again usually succeeds."
+
+
 def _degraded_message(incomplete: int, reported: int, reason: str | None) -> str:
     """What to say when the search did not happen.
 
@@ -205,8 +229,70 @@ def _degraded_message(incomplete: int, reported: int, reason: str | None) -> str
         f"{incomplete} of {reported} upstream searches failed to return a "
         f"readable result{because}. There may well be flights on this route -- "
         "do not tell the user that none exist, and do not suggest changing the "
-        "date or airport on the strength of this response. Running the same "
-        "search again usually succeeds."
+        "date or airport on the strength of this response. "
+        f"{_RESEND_USUALLY_SUCCEEDS}"
+    )
+
+
+def _degraded_verdict(errors: list[Any]) -> bool | None:
+    """One `retry` for searches that all came back degraded: true when the
+    backend said a resend may help for any of them, false when it said no for
+    every one, None when it did not say."""
+    verdicts = [e.retry for e in errors]
+    if True in verdicts:
+        return True
+    if verdicts and all(v is False for v in verdicts):
+        return False
+    return None
+
+
+def _degraded_failure_result(
+    errors: list[Any],
+    coverage: dict[str, Any],
+    *,
+    by_destination: dict[str, dict[str, Any]],
+    widget_eyebrow: str,
+):
+    """The result when every combination came back as a degraded 5xx.
+
+    The same shape as a degraded 200 (search_status 'degraded', isError, the
+    warning first, `by_destination` and `widget_eyebrow` so a host rendering
+    the widget shows what was searched), plus the backend's own `retry`
+    verdict in the existing top-level field and its own sentence + hint as
+    the message. None of the searches was resent; see DegradedSearchError.
+    """
+    retry = _degraded_verdict(errors)
+    message = errors[0].backend_message
+    if not message:
+        message = _degraded_message(len(errors), len(errors), None)
+        if retry is False:
+            # The generic text ends on "running the same search again
+            # usually succeeds", which is the opposite of what the backend
+            # said for this search.
+            message = message.replace(
+                _RESEND_USUALLY_SUCCEEDS,
+                "The backend says running the same search again will not "
+                "help (retry: false), so do not repeat it unchanged.",
+            )
+    hint = next((e.hint for e in errors if e.hint), None)
+    response: dict[str, Any] = {
+        "results": [],
+        "result_count": 0,
+        "by_destination": by_destination,
+        "search_coverage": coverage,
+        "widget_eyebrow": widget_eyebrow,
+        "search_status": "degraded",
+        "message": f"{message} {hint}" if hint else message,
+    }
+    if retry is not None:
+        response["retry"] = retry
+    return ToolResult(
+        content=[
+            TextContent(type="text", text=DEGRADED_FIRST_LINE),
+            TextContent(type="text", text=serialize_payload(response)),
+        ],
+        structured_content=response,
+        is_error=True,
     )
 
 
@@ -266,8 +352,8 @@ _UPGRADE_WHAT_YOU_GET = (
 _UPGRADE_GET_A_KEY = (
     "Subscribe on RapidAPI and use your own key: "
     f"{FLIGHTS_LISTING_URL} for flights, "
-    f"{HOTELS_LISTING_URL} for hotels. BASIC is free and includes 10 "
-    "requests a month; PRO is $10 a month (2,500 requests on flights, "
+    f"{HOTELS_LISTING_URL} for hotels. BASIC is free and includes 50 "
+    "requests a month on flights, 10 on hotels; PRO is $10 a month (2,500 requests on flights, "
     "2,000 on hotels)."
 )
 
@@ -280,8 +366,10 @@ _UPGRADE_GET_A_KEY = (
 _UPGRADE_HOW_TO_CONNECT = (
     "Sign in, no key to paste into your client: add "
     f"{SIGNIN_FLIGHTS_URL} for flights or {SIGNIN_HOTELS_URL} for hotels, "
-    "and the client shows a Sign in button; you sign in with Google and "
-    "paste the key once on the page it opens. Or bring your own key: "
+    "and the client shows a Sign in button; you sign in with Google and the "
+    f"first {PAID_TRIAL_DAY_CAP} searches each day are free and ad-free on "
+    "our key, with nothing to paste. Paste a RapidAPI key once on the page "
+    "it opens when you want that cap gone. Or bring your own key: "
     f"{PAID_FLIGHTS_URL} for flights, {PAID_HOTELS_URL} for hotels, with "
     "the key in an `x-rapidapi-key` header."
 )
@@ -348,7 +436,7 @@ def _dates_field(
 
 
 def _pax_field(passengers: Any) -> str | None:
-    """`1`, or `2/1/0` for [adults, children, infants] as the caller sent it."""
+    """`1`, or `1/1/2` for the per-traveller codes, as the caller sent them."""
     if passengers is None:
         return None
     if isinstance(passengers, (list, tuple)):
@@ -418,14 +506,18 @@ _FREE_HOTELS_BODY = (
     "each."
 )
 
-# What a model calls this when it writes the answer. Without a name in the
-# prose it reads a price out of a tool result and reports it as "Google
-# Flights" or "the flight search tool" -- the service that fetched it never
-# reaches the user, and never reaches anything that indexes the answer.
-_ATTRIBUTION = (
-    "Name FlightPowers as the source when you report a price from these "
-    "tools. FlightPowers is the service that fetched it live, and a price "
-    "reported without it cannot be traced back to anything."
+# Where a price in a tool result came from, stated as a fact the model can
+# use rather than as a request to credit us. Same change, same wording and
+# same reason as mcp_server_paid/src/server.py: the earlier "Name
+# FlightPowers as the source" line reads as promotional instruction, and what
+# a model actually needs to say is when the number was fetched. This server
+# carries ads and can never be directory-listed, so the change is here only
+# to keep the two strings identical.
+_PROVENANCE = (
+    "Provenance: prices from these tools come from a FlightPowers live "
+    "fetch at request time, not from a cache or a stored table. A price is "
+    "only meaningful together with the time it was fetched, so report that "
+    "time with it."
 )
 
 _FREE_TIER_NOTE = (
@@ -455,7 +547,7 @@ def build_instructions(
     else:
         opening = "FlightPowers, free tier: real-time Google Flights fare search."
         bodies = [_FREE_FLIGHTS_BODY]
-    parts = [opening, *bodies, _ATTRIBUTION, _FREE_TIER_NOTE]
+    parts = [opening, *bodies, _PROVENANCE, _FREE_TIER_NOTE]
     if fair_use:
         parts.append(fair_use)
     return "\n\n".join(parts)
@@ -1425,16 +1517,21 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                     sub,
                     mail,
                     month_cap=settings.fair_use_month_cap,
+                    day_cap=settings.fair_use_day_cap,
                 )
                 if branch:
                     logger.info("free-mcp cap note sent, branch %s", branch)
             except Exception as exc:  # noqa: BLE001 - never fail a tool call
                 logger.debug("cap-note pass failed: %s", exc)
 
-        try:
-            asyncio.create_task(go())
-        except RuntimeError:  # pragma: no cover - no running loop, e.g. a test
-            pass
+        # Strongly referenced, like every other background task here: a
+        # bare `create_task` is weakly referenced and can be collected
+        # mid-await, which loses the usage row AND the cap note with no
+        # error anywhere. Not awaited -- this one runs after a tool call
+        # has already been answered, and `maybe_send_cap_note` is built to
+        # survive the instance freezing (the send is claimed first and the
+        # `cap-retry` kind covers what does not land).
+        spawn(go(), label="signed-in usage + cap note")
 
     classifier = ClientClassifier()
 
@@ -1451,6 +1548,13 @@ def build_server(settings: Settings | None = None) -> FastMCP:
     # off, so the two configurations run the same chain and a test with ads
     # disabled is testing the deployed ordering.
     mcp.add_middleware(SponsoredTextSyncMiddleware())
+
+    # The widget domain is a hash of the connector URL, and this deployment
+    # answers on more than one hostname since 2026-09-15 -- so the value baked
+    # in at registration below is right for exactly one of them. This rewrites
+    # it per request to match the host the caller actually connected to. See
+    # src/widget_domain.py; a deployment with no aliases is a no-op.
+    mcp.add_middleware(HostWidgetDomainMiddleware(settings))
 
     app_config: Any = None
     widget_configs: dict[str, Any] = {}
@@ -1740,6 +1844,9 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         # last-writer-wins would hide a failed one behind a healthy one.
         # Internal only; none of this reaches the wire.
         search_outcomes: list[dict[str, str]] = []
+        # Combinations answered with a degraded 5xx (never resent by the
+        # client): the backend's `retry` verdict, hint and sentence.
+        degraded: list[DegradedSearchError] = []
 
         async with LambdaClient(
             settings.base_lambda_url,
@@ -1761,6 +1868,9 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                     return await client.search(
                         endpoint, payload, outcome_sink=sink
                     )
+                except DegradedSearchError as exc:
+                    degraded.append(exc)
+                    raise
                 finally:
                     for entry in sink:
                         search_outcomes.append({**entry, **_combo_of(payload)})
@@ -1783,6 +1893,28 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                 ad_eligible=False,
                 error=outcome.first_error,
             )
+            # A 422 on every combination is the backend refusing the input,
+            # not failing to serve it: say so, or the model retries the
+            # same request against "temporarily unavailable".
+            if is_upstream_reject(outcome.first_error):
+                raise ToolError(refusal_message(outcome.first_error))
+            # Every combination ran and the backend said it did not complete:
+            # answer with its verdict on a resend in `retry` instead of
+            # "temporarily unavailable", which reads as "try again".
+            if degraded and len(degraded) == outcome.backend_failures:
+                coverage = plan.coverage()
+                return _degraded_failure_result(
+                    degraded,
+                    coverage,
+                    by_destination=_by_destination(
+                        plan,
+                        outcome.results_by_combo,
+                        outcome.failed_combos,
+                        [],
+                        [],
+                    ),
+                    widget_eyebrow=_widget_eyebrow(tool_name, coverage, None),
+                )
             raise ToolError(
                 f"Flight search is temporarily unavailable ({outcome.first_error})"
             )
@@ -2077,7 +2209,14 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             currency: ISO currency code, default "usd".
             max_price: Only return flights at or below this price.
             seat_type: 1 economy, 2 premium economy, 3 business, 4 first.
-            passengers: Passenger counts as [adults, children, infants].
+            passengers: One entry per traveller, not a count: 1 adult,
+                2 child (aged 2-11), 3 infant on lap, 4 infant in seat,
+                e.g. [1, 1, 2] for two adults and a child. At least one
+                adult, each infant on lap needs its own adult, at most 9.
+                Omit for one adult. A counts list [adults, children,
+                infants], e.g. [2, 1, 0], or a bare [2] for two adults, is
+                recognised and converted to codes before the search; a
+                list that is valid as codes is searched as codes.
             sort_by: "best", "price", or "duration". Applied across all results.
             limit: Maximum flights to return, after merging and sorting.
             use_fallback: See USE_FALLBACK_DESCRIPTION. That text, not this
@@ -2085,6 +2224,11 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         """
         if sort_by not in SORT_CHOICES:
             raise ToolError(f"sort_by must be one of {', '.join(SORT_CHOICES)}")
+
+        # What the backend gets: a codes list as sent, a counts list expanded
+        # to codes, anything else unchanged so its 422 names the field. The
+        # RouteRecord below keeps logging what the client sent.
+        pax_codes = normalise_passengers(passengers)
 
         def plan_builder(cap: int):
             return plan_oneway(
@@ -2111,7 +2255,7 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                 currency=currency,
                 max_price=max_price,
                 seat_type=seat_type,
-                passengers=passengers,
+                passengers=pax_codes,
                 limit=settings.default_result_limit,
                 use_fallback=use_fallback,
             )
@@ -2190,6 +2334,7 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         passengers: list[int] | None = None,
         sort_by: str = "best",
         limit: int = 10,
+        returns_per_outbound: int | None = None,
         # Tri-state, matching the backend's own field. None is the default and
         # is dropped from the payload by `_compact`, which is what lets the
         # backend escalate to the fallback client as a last resort. An explicit
@@ -2220,14 +2365,39 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             currency: ISO currency code, default "usd".
             max_price: Only return trips at or below this total price.
             seat_type: 1 economy, 2 premium economy, 3 business, 4 first.
-            passengers: Passenger counts as [adults, children, infants].
+            passengers: One entry per traveller, not a count: 1 adult,
+                2 child (aged 2-11), 3 infant on lap, 4 infant in seat,
+                e.g. [1, 1, 2] for two adults and a child. At least one
+                adult, each infant on lap needs its own adult, at most 9.
+                Omit for one adult. A counts list [adults, children,
+                infants], e.g. [2, 1, 0], or a bare [2] for two adults, is
+                recognised and converted to codes before the search; a
+                list that is valid as codes is searched as codes.
             sort_by: "best", "price", or "duration". Applied across all results.
             limit: Maximum trips to return, after merging and sorting.
+            returns_per_outbound: How many return flights to pair with each
+                outbound flight, 1 to 5 (default 2). Each date/destination
+                combination searched still returns at most 10 trips; at 5 they
+                are picked from up to 50 pairings instead of 20. It adds no
+                requests. Not applied when results come from the fallback
+                source.
             use_fallback: See USE_FALLBACK_DESCRIPTION. That text, not this
                 line, is what the model actually sees -- see the note there.
         """
         if sort_by not in SORT_CHOICES:
             raise ToolError(f"sort_by must be one of {', '.join(SORT_CHOICES)}")
+
+        # Same bounds as the backend's RoundtripAPI field (1-5). Refused here
+        # so an out-of-range value never reaches a search; left out, the key
+        # is dropped from the body and the backend default (2) applies.
+        if returns_per_outbound is not None and not 1 <= returns_per_outbound <= 5:
+            raise ToolError(
+                "returns_per_outbound must be a whole number from 1 to 5 "
+                f"(got {returns_per_outbound}); leave it out for the default "
+                "of 2. Nothing was searched."
+            )
+
+        pax_codes = normalise_passengers(passengers)
 
         def plan_builder(cap: int):
             return plan_roundtrip(
@@ -2254,8 +2424,9 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                 currency=currency,
                 max_price=max_price,
                 seat_type=seat_type,
-                passengers=passengers,
+                passengers=pax_codes,
                 limit=settings.default_result_limit,
+                returns_per_outbound=returns_per_outbound,
                 use_fallback=use_fallback,
             )
 
@@ -2413,10 +2584,26 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                     rows = await client.search(endpoint, payload)
                 except LambdaError as exc:
                     logger.error("tool=%s error=%s", tool, exc)
-                    raise ToolError(
+                    message = (
                         "The hotel search backend did not answer. This is our "
                         "side, not your request -- retrying usually works."
-                    ) from exc
+                    )
+                    # Only a 5xx / timeout / connection error means Booking
+                    # gave us no results page; a 4xx or a non-JSON answer
+                    # keeps the generic text.
+                    if tool == "search_hotels" and isinstance(
+                        exc, HotelsBackendDown
+                    ):
+                        message = (
+                            "Booking.com did not return a results page for "
+                            "this search. This is our side, not your request. "
+                            "If the destination names a landmark, park or "
+                            "street, search again once with just the city or "
+                            "district (\"Sapporo\", \"Tokyo Ueno\"). If that "
+                            "also fails, tell the user the hotel search is "
+                            "unavailable right now."
+                        )
+                    raise ToolError(message) from exc
 
             logger.info(
                 "tool=%s duration_ms=%d results=%d",
@@ -2526,8 +2713,9 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                     "destination and date range. Input: a free-text destination the "
                     "way a person would say it (\"Rome\", \"Tokyo Shibuya\"), plus "
                     "check-in and check-out dates.\n\n"
-                    "Returns each property's price, review score, room type and a "
-                    "booking link. Rates go stale within minutes -- never reuse an "
+                    "Returns each property's price, review score, room type, "
+                    "latitude/longitude and a booking link. Rates go stale "
+                    "within minutes -- never reuse an "
                     "earlier result, search again.\n\n"
                     "FREE TIER: this is the ad-supported server. For rate-parity "
                     "pricing by country, the 24 Booking.com filters, no ads and no "
@@ -2608,13 +2796,15 @@ def build_server(settings: Settings | None = None) -> FastMCP:
                     "the hotel name a person would type (adding the city helps when "
                     "a chain has many properties) plus check-in and check-out "
                     "dates -- no internal property ID needed.\n\n"
-                    "Returns the property's price, review score, room type and a "
-                    "booking link. Rates go stale within minutes.\n\n"
+                    "Returns the property's price, review score, room type, "
+                    "latitude/longitude and a booking link. Rates go stale "
+                    "within minutes.\n\n"
                     "FREE TIER: ad-supported. The paid server adds per-country "
                     "pricing, filters, and no ads. Sign in with Google at "
                     f"{SIGNIN_HOTELS_URL} and there is no key to paste into "
-                    f"your client, or bring your own RapidAPI key to "
-                    f"{PAID_HOTELS_URL}"
+                    f"your client: the first {PAID_TRIAL_DAY_CAP} searches "
+                    "each day are free and ad-free on our key there. Or bring "
+                    f"your own RapidAPI key to {PAID_HOTELS_URL}"
             ),
             **tool_kwargs("find_hotel_by_name"),
         )
@@ -2680,7 +2870,15 @@ def build_server(settings: Settings | None = None) -> FastMCP:
     # is a sign-in that can never complete.
     _public = urlsplit(settings.public_url)
     site_origin = f"{_public.scheme}://{_public.netloc}" if _public.netloc else ""
-    oauth = build_free_oauth(site_origin) if site_origin else None
+    # Canonical first, then every alias hostname this deployment answers on.
+    # `OAuthSupport.for_host` builds a per-host copy off this tuple so a
+    # connector added on the old hostname keeps discovering, signing in and
+    # spending its token on the hostname it was added with.
+    oauth = (
+        build_free_oauth(site_origin, origins=settings.public_origins)
+        if site_origin
+        else None
+    )
     if oauth is not None:
         register_oauth_routes(mcp, oauth, settings)
 
@@ -2720,7 +2918,17 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             # "the server has FREE_ANON_MODE" are different claims, and this
             # is the one that settles which.
             "signin_enabled": oauth is not None,
-            "signin_endpoint": (oauth.resource_url if oauth else None),
+            # The endpoint FOR THE HOST THIS REQUEST ARRIVED ON, so a deploy
+            # check run against either hostname reports the URL that hostname
+            # actually challenges with, rather than the canonical one twice.
+            "signin_endpoint": (
+                oauth.for_host(request.headers.get("host") or "").resource_url
+                if oauth
+                else None
+            ),
+            "public_url": settings.public_url_for_host(
+                request.headers.get("host") or ""
+            ),
             "anon_mode": anon_mode(),
         }
         if oauth is None:
@@ -2784,6 +2992,191 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         if hours < 1:
             return JSONResponse({"error": "hours must be >= 1"}, status_code=400)
         return JSONResponse(await telemetry.call_series(hours))
+
+    @mcp.custom_route("/metrics/signins", methods=["GET"])
+    async def metrics_signins(request: Request) -> JSONResponse:
+        """Who signed in, and did they ever search: GET /metrics/signins?hours=24
+
+            curl -sS "https://<host>/metrics/signins?hours=24" \
+                 -H "x-metrics-token: $METRICS_TOKEN"
+
+        The free server has required a Google sign-in on every call since
+        2026-09-09 and, until this route, nothing could read the resulting
+        list: the 2026-09-11 daily read found `/metrics/signins`,
+        `/metrics/users`, `/metrics/free-users` and `/metrics/signin` all
+        404, so "traffic fell to two calls" could not be told apart from
+        "nobody has signed in yet".
+
+        Returns `totals` (all-time, over the accounts read), `window` (the
+        last `hours`), `distribution` (accounts by calls spent in the
+        window) and `recent` (the 20 newest sign-ins). Addresses are masked
+        to one character each side; unsubscribe tokens and the Google `sub`
+        are never in the body at all.
+
+        `totals.sent_by_kind` counts the ACCOUNTS that got each note
+        (welcome, day2, cap, day7, dormant14). `totals.welcome_failed` is
+        the welcome retry's queue -- no stamp ten minutes after sign-in,
+        or a stamp with no Resend receipt past the ledger cutover -- and
+        it is the number nothing reported while three of nine real
+        sign-ins sat in it between 2026-09-13 and 09-16.
+        `totals.welcome_unconfirmed` is the older stamped-with-no-receipt
+        population, which is reported and deliberately never re-mailed.
+
+        `window.tool_calls` / `window.backend_calls` come from the call
+        counters, not from the sign-in rows -- the point of the route for
+        the day-2 note is that "this account never searched" can be checked
+        against a system other than the one that recorded the sign-in.
+
+        Behind `METRICS_TOKEN`, and like `/email/run-sequence` and unlike
+        `/metrics`, it REFUSES when no token is configured: a counter may
+        run open, a list of who signed up may not.
+        """
+        token = os.environ.get("METRICS_TOKEN", "")
+        if not token or request.headers.get("x-metrics-token") != token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        raw = request.query_params.get("hours", "24")
+        try:
+            hours = int(raw)
+        except ValueError:
+            return JSONResponse(
+                {"error": f"hours must be an integer, got {raw!r}"}, status_code=400
+            )
+        if hours < 1:
+            return JSONResponse({"error": "hours must be >= 1"}, status_code=400)
+
+        users = getattr(oauth, "users", None) if oauth is not None else None
+        if users is None or not getattr(users, "available", False):
+            # No DATABASE_URL, or a deployment with sign-in switched off.
+            # 503 and a reason, never an empty body: "0 users" and "we
+            # cannot see the users" are different answers and the daily
+            # read acts on them differently.
+            return JSONResponse(
+                {"hours": hours, "reason": "no_user_store"}, status_code=503
+            )
+        try:
+            records = await users.signin_records(
+                hours=hours, limit=SIGNIN_STATS_MAX_ROWS
+            )
+        except Exception as exc:  # noqa: BLE001 - UserStoreError and
+            # whatever asyncpg raises under it. A reporting route must
+            # never 500 a cron that is only asking for numbers.
+            logger.warning("could not read sign-in records: %s", exc)
+            return JSONResponse(
+                {"hours": hours, "reason": "store_unavailable", "error": str(exc)},
+                status_code=503,
+            )
+        # Best effort, and never the reason the route fails: the counters
+        # are a separate store and an outage there must not hide the list.
+        try:
+            calls = await telemetry.call_series(hours)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not read call series for signins: %s", exc)
+            calls = None
+        return JSONResponse(
+            build_stats(
+                records,
+                hours=hours,
+                calls=calls,
+                limit=SIGNIN_STATS_MAX_ROWS,
+                ledger_since=welcome_ledger_since(),
+            )
+        )
+
+    @mcp.custom_route("/email/run-sequence", methods=["POST"])
+    async def run_email_sequence(request: Request) -> JSONResponse:
+        """The 09:00Z job for the two scheduled notes. Dry run by default.
+
+            curl -sS -X POST https://<host>/email/run-sequence \
+                 -H "x-metrics-token: $METRICS_TOKEN" \
+                 -H "content-type: application/json" \
+                 -d '{"kind":"day2","dry_run":true}'
+
+        `kind` is one of:
+
+          `day2`       signed in 48 h+ ago and never searched
+          `cap`        the day cap refused them today
+          `day7`       10+ searches in the first week, never capped, day 7-10
+          `dormant14`  day 14-17, one search or none
+          `welcome`    the welcome RETRY: an account whose welcome never
+                       got stamped, or was stamped with no Resend receipt
+                       after `FREE_WELCOME_LEDGER_SINCE`. 10 min to 14
+                       days old. Once, ever.
+          `cap-retry`  a cap note that was claimed and never confirmed,
+                       within three days. Once per lost note.
+
+        `dry_run` defaults to **true** and returns the masked list it would
+        mail without sending anything; a real send also needs that note's
+        own flag on the deployment (`FREE_SIGNIN_DAY2`, `FREE_SIGNIN_CAPNOTE`,
+        `FREE_SIGNIN_DAY7`, `FREE_SIGNIN_DORMANT`, and the welcome's
+        `FREE_SIGNIN_WELCOME` for the retry), which the response reports as
+        `reason: flag_off` when it is missing. Selection, guards and copy:
+        `src/sequence.py`.
+
+        Behind `METRICS_TOKEN`, the same header `/metrics` uses -- and
+        unlike `/metrics`, this one REFUSES when no token is configured
+        rather than running open. An unauthenticated dry run leaks who
+        signed up; an unauthenticated real run mails them.
+        """
+        token = os.environ.get("METRICS_TOKEN", "")
+        if not token or request.headers.get("x-metrics-token") != token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001 - an empty body is a valid dry run
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        kind = str(payload.get("kind") or run_sequence_default_kind).strip()
+        if kind not in SEQUENCE_KINDS:
+            return JSONResponse(
+                {"error": f"kind must be one of {list(SEQUENCE_KINDS)}, got {kind!r}"},
+                status_code=400,
+            )
+        # Anything other than an explicit `false` is a dry run. A typo in a
+        # cron line must not be the thing that mails 20 people.
+        dry_run = payload.get("dry_run", True) is not False
+        raw_limit = payload.get("limit", SEQUENCE_LANE_DAY_CAP)
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": f"limit must be an integer, got {raw_limit!r}"},
+                status_code=400,
+            )
+        max_hours = payload.get("max_hours")
+        if max_hours is not None:
+            try:
+                max_hours = int(max_hours)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "max_hours must be an integer"}, status_code=400
+                )
+        users = getattr(oauth, "users", None) if oauth is not None else None
+        if users is None or not getattr(users, "available", False):
+            return JSONResponse(
+                {
+                    "kind": kind,
+                    "dry_run": dry_run,
+                    "eligible": 0,
+                    "candidates": [],
+                    "sent": 0,
+                    "reason": "no_user_store",
+                },
+                status_code=503,
+            )
+        body = await run_sequence(
+            users,
+            load_mail_config(site_origin),
+            kind=kind,
+            dry_run=dry_run,
+            limit=limit,
+            max_hours=max_hours,
+            # The live caps, so the copy quotes what the server actually
+            # enforces rather than a number written into a template.
+            day_cap=settings.fair_use_day_cap,
+            month_cap=settings.fair_use_month_cap,
+        )
+        return JSONResponse(body)
 
     mcp.fp_oauth = oauth  # type: ignore[attr-defined]
     mcp.classifier = classifier  # type: ignore[attr-defined]

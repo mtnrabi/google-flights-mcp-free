@@ -47,6 +47,45 @@ class LambdaError(RuntimeError):
     """The backend could not answer this search."""
 
 
+class DegradedSearchError(LambdaError):
+    """A 5xx with `X-Search-Status: degraded`: the backend ran the search and
+    says it did not complete. Never resent here: the backend already judged
+    whether a resend can help (`retry` in its body, None when absent)."""
+
+    def __init__(
+        self,
+        message: str,
+        retry: bool | None,
+        backend_message: str | None = None,
+        hint: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry = retry
+        self.backend_message = backend_message
+        self.hint = hint
+
+
+def degraded_error(endpoint: str, last_error: str, response: httpx.Response):
+    """The `DegradedSearchError` for a degraded 5xx, carrying the backend
+    body's `retry`, `message` and `hint` (each None when absent or not the
+    right type; `retry` is never guessed)."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        body = {}
+    retry = body.get("retry")
+    message = body.get("message")
+    hint = body.get("hint")
+    return DegradedSearchError(
+        f"{endpoint} search did not complete -- {last_error}",
+        retry if isinstance(retry, bool) else None,
+        message.strip() if isinstance(message, str) and message.strip() else None,
+        hint.strip() if isinstance(hint, str) and hint.strip() else None,
+    )
+
+
 # The backend reports the outcome of a search in headers under this prefix.
 # `X-Search-Status: degraded` means the search did not complete, so the `[]` it
 # came with says nothing about flight availability. Matched by prefix so a
@@ -173,6 +212,7 @@ def build_roundtrip_payload(
     seat_type: int | None = None,
     passengers: list[int] | None = None,
     limit: int | None = None,
+    returns_per_outbound: int | None = None,
     use_fallback: bool | None = None,
     use_ext_proxy: bool | None = None,
 ) -> dict[str, Any]:
@@ -203,6 +243,7 @@ def build_roundtrip_payload(
             "seat_type": seat_type,
             "passengers": passengers,
             "limit": limit,
+            "returns_per_outbound": returns_per_outbound,
             "use_fallback": use_fallback,
             "use_ext_proxy": use_ext_proxy,
         }
@@ -301,6 +342,13 @@ class LambdaClient:
 
             body = response.text[:300]
             last_error = f"HTTP {response.status_code}: {body}"
+            if read_search_status(response).get(
+                SEARCH_STATUS_HEADER
+            ) == SEARCH_STATUS_DEGRADED:
+                # Same rule as the api front's degraded_search_error: the
+                # search ran and did not complete, so a resend is the caller's
+                # call (on `retry`), never this client's.
+                raise degraded_error(endpoint, last_error, response)
             if response.status_code not in _RETRYABLE_STATUS:
                 raise LambdaError(f"{endpoint} search failed -- {last_error}")
             if attempt == _MAX_ATTEMPTS:

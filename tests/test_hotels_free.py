@@ -12,13 +12,16 @@ import httpx
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from jsonschema import Draft202012Validator
 
 import src.server as server_module
 from src.hotels_lambda_client import (
+    HotelsBackendDown,
     HotelsLambdaClient,
     build_search_payload,
 )
 from src.lambda_client import LambdaError
+from src.output_schema import FLIGHTS_OUTPUT_SCHEMA, HOTELS_OUTPUT_SCHEMA
 from src.server import build_server
 from src.settings import load_settings
 
@@ -115,6 +118,76 @@ class TestClientNormalisation:
                     await c.search("search", {})
         assert len(calls) == 1
 
+    @pytest.mark.asyncio
+    async def test_a_fast_502_is_retried_once(self):
+        calls = []
+
+        def handler(_r):
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(502, text="cold start")
+            return httpx.Response(200, json={"properties": [PROPERTY]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            async with HotelsLambdaClient("https://h.test", "s", client=http) as c:
+                rows = await c.search("search", {})
+        assert len(calls) == 2 and rows == [PROPERTY]
+
+    @pytest.mark.asyncio
+    async def test_a_slow_502_is_not_retried(self, monkeypatch):
+        """A 502 at ~67 s already carries the Lambda's own fresh-IP retry;
+        a second attempt only doubled the user's wait (2026-10-16/17)."""
+        import src.hotels_lambda_client as hlc
+
+        monkeypatch.setattr(hlc, "_RETRY_ONLY_UNDER_SECONDS", -1.0)
+        calls = []
+
+        def handler(_r):
+            calls.append(1)
+            return httpx.Response(502, text="Failed to load Booking.com results")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            async with HotelsLambdaClient("https://h.test", "s", client=http) as c:
+                with pytest.raises(LambdaError, match="after 1 attempt"):
+                    await c.search("search", {})
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fault",
+        [httpx.ReadTimeout("read timed out"), httpx.ConnectError("refused")],
+    )
+    async def test_a_slow_timeout_or_transport_error_is_not_retried(
+        self, monkeypatch, fault
+    ):
+        """The `_slow(started)` check in the except block: a timeout at the
+        client limit is slow by definition, so no second wait."""
+        import src.hotels_lambda_client as hlc
+
+        monkeypatch.setattr(hlc, "_RETRY_ONLY_UNDER_SECONDS", -1.0)
+        calls = []
+
+        def handler(_r):
+            calls.append(1)
+            raise fault
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            async with HotelsLambdaClient("https://h.test", "s", client=http) as c:
+                with pytest.raises(HotelsBackendDown, match="after 1 attempt"):
+                    await c.search("search", {})
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_4xx_is_a_plain_lambda_error(self):
+        def handler(_r):
+            return httpx.Response(422, text="bad destination")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            async with HotelsLambdaClient("https://h.test", "s", client=http) as c:
+                with pytest.raises(LambdaError) as exc:
+                    await c.search("search", {})
+        assert not isinstance(exc.value, HotelsBackendDown)
+
     def test_none_values_are_dropped(self):
         got = build_search_payload(
             destination="Rome",
@@ -199,7 +272,7 @@ class TestRegistration:
         assert "https://rapidapi.com/mtnrabi/api/google-flights-live-api" in key
         assert "https://rapidapi.com/mtnrabi/api/booking-live-api" in key
         # The listings' own billingPlans figures, cited in fair_use.py.
-        assert "BASIC is free and includes 10 requests a month" in key
+        assert "BASIC is free and includes 50 requests a month on flights, 10 on hotels" in key
         assert "PRO is $10 a month" in key
 
     def test_the_get_a_key_sentence_cannot_drift_from_upgrade_steps(self):
@@ -211,7 +284,8 @@ class TestRegistration:
         from src.server import _UPGRADE_GET_A_KEY
 
         priced = (
-            "BASIC is free and includes 10 requests a month; PRO is $10 a "
+            "BASIC is free and includes 50 requests a month on flights, 10 on "
+            "hotels; PRO is $10 a "
             "month (2,500 requests on flights, 2,000 on hotels)."
         )
         assert priced in _UPGRADE_GET_A_KEY
@@ -257,6 +331,58 @@ class TestRegistration:
             )
         assert out.structured_content["result_count"] == 0
         assert "message" in out.structured_content
+
+
+class TestCoordinates:
+    """hotel_agent #46 added latitude/longitude to every row. Rows pass
+    through this server, affiliate wrap included; a null (Booking published
+    none) must arrive as null, not vanish."""
+
+    LOCATED = {**PROPERTY, "latitude": 41.91150739413484, "longitude": 12.500005960464478}
+    UNLOCATED = {**PROPERTY, "name": "No Pin Inn", "latitude": None, "longitude": None}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stay22_aid", ["", "flightpowers"])
+    @pytest.mark.parametrize(
+        "tool,args",
+        [
+            ("search_hotels", {"destination": "Rome"}),
+            ("find_hotel_by_name", {"hotel_name": "Hotel Leone"}),
+        ],
+    )
+    async def test_coordinates_pass_through_and_null_survives(
+        self, tmp_path, monkeypatch, stub_hotels, tool, args, stay22_aid
+    ):
+        monkeypatch.setenv("LOG_PATH", str(tmp_path / "calls.jsonl"))
+        monkeypatch.setenv("ADS_ENABLED", "false")
+        monkeypatch.setenv("ENFORCEMENT_MODE", "monitor")
+        monkeypatch.setenv("HOTELS_LAMBDA_URL", "https://hotels.test")
+        monkeypatch.setenv("HOTELS_AUTH", "secret")
+        monkeypatch.setenv("STAY22_AID", stay22_aid)
+        stub_hotels[:] = [self.LOCATED, self.UNLOCATED]
+        async with Client(build_server(load_settings())) as client:
+            out = await client.call_tool(
+                tool,
+                {**args, "checkin_date": "2026-11-10", "checkout_date": "2026-11-13"},
+            )
+        located, unlocated = out.structured_content["results"]
+        assert located["latitude"] == 41.91150739413484
+        assert located["longitude"] == 12.500005960464478
+        assert "latitude" in unlocated and unlocated["latitude"] is None
+        assert "longitude" in unlocated and unlocated["longitude"] is None
+        if stay22_aid:
+            assert "stay22.com" in located["link"], "the wrap was off"
+        Draft202012Validator(HOTELS_OUTPUT_SCHEMA).validate(out.structured_content)
+
+    def test_the_schema_declares_coordinates_on_hotel_rows_only(self):
+        items = HOTELS_OUTPUT_SCHEMA["properties"]["results"]["items"]
+        for field in ("latitude", "longitude"):
+            assert items["properties"][field] == {
+                "anyOf": [{"type": "number"}, {"type": "null"}]
+            }
+        assert "required" not in items
+        flight_items = FLIGHTS_OUTPUT_SCHEMA["properties"]["results"]["items"]
+        assert "properties" not in flight_items
 
 
 class TestWidgetMapping:
@@ -433,3 +559,47 @@ class TestTheServerDescribesWhatItActuallyOffers:
                 )
         assert "This is our side" in str(exc.value)
         assert "NameError" not in str(exc.value)
+        # A plain LambdaError (4xx, non-JSON) keeps the generic text.
+        assert "retrying usually works" in str(exc.value)
+        assert "Booking.com did not return" not in str(exc.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool,args,want,not_want",
+        [
+            (
+                "search_hotels",
+                {"destination": "Rome"},
+                "search again once with just the city or district",
+                "retrying usually works",
+            ),
+            (
+                "find_hotel_by_name",
+                {"hotel_name": "Hotel Leone"},
+                "retrying usually works",
+                "Booking.com did not return",
+            ),
+        ],
+    )
+    async def test_a_backend_outage_message_per_tool(
+        self, hotels_server, monkeypatch, tool, args, want, not_want
+    ):
+        """A 5xx / timeout gets the re-search advice on search_hotels only;
+        find_hotel_by_name keeps the old text."""
+
+        async def fail(self, endpoint, payload):
+            raise HotelsBackendDown("search failed after 1 attempt(s) -- HTTP 502")
+
+        monkeypatch.setattr(HotelsLambdaClient, "search", fail, raising=True)
+        async with Client(hotels_server) as client:
+            with pytest.raises(ToolError) as exc:
+                await client.call_tool(
+                    tool,
+                    {**args, "checkin_date": "2026-11-10", "checkout_date": "2026-11-13"},
+                )
+        assert want in str(exc.value)
+        assert not_want not in str(exc.value)
+        if tool == "search_hotels":
+            assert str(exc.value).rstrip().endswith(
+                "tell the user the hotel search is unavailable right now."
+            )

@@ -50,19 +50,26 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 
 import httpx
 
 from .email_templates import Cta, Hero
 from .email_templates import Email as BrandedEmail
+from .email_templates import ladder
 from .email_templates import render as render_branded
+from .email_templates.names import first_name_from_email
 from .freeusers import (
     RESEND_ADDED,
     RESEND_FAILED,
     RESEND_SKIPPED,
+    WELCOME_KIND,
     CapSignals,
+    cap_kind,
 )
+from .giftfare import gift_fare_bracket
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +92,32 @@ WELCOME_ENV = "FREE_SIGNIN_WELCOME"
 #: upsell, and CLAUDE.md rule 14 (35 Studio upsell notes, 0 replies, 0
 #: upgrades) is the reason those two are not allowed to share a flag.
 CAPNOTE_ENV = "FREE_SIGNIN_CAPNOTE"
+#: `on` sends the day-2 activation note -- the one scheduled send that goes
+#: to somebody who signed in and then did nothing. Its own switch again, and
+#: for the same reason the cap note has one: three sends that can be turned
+#: on together will be turned on together by accident.
+DAY2_ENV = "FREE_SIGNIN_DAY2"
+#: `on` sends the day-7 note -- ten or more searches in the first week and
+#: never capped (`state/gtm/email/FREE-SIGNIN-UPSELL-2026-09-17.md` (b)).
+#: Its own switch, like every other note in this lane: four sends that can
+#: be turned on together will be turned on together by accident.
+DAY7_ENV = "FREE_SIGNIN_DAY7"
+#: `on` sends the dormant note -- two weeks in, one search or none, (c).
+DORMANT_ENV = "FREE_SIGNIN_DORMANT"
 
 #: From/Reply-To for this lane. `app@` deliberately, never `matan@` (the cold
 #: B2B lane since 2026-09-09) and never Gmail. The From never changes.
 FROM_ADDRESS = "Matan Rabi <app@flightpowers.com>"
 
 _USER_AGENT = "flightpowers-free-mcp/1.0 (+https://flightpowers.com)"
+
+#: The ceiling on the INLINE cap note's fare lookup. Short on purpose: it
+#: runs in the background task that follows a tool call, and a serverless
+#: instance can be frozen at any point in it, so a slow fare is a lost
+#: NOTE. Past this the bracket is dropped and the note goes out without
+#: that sentence. The daily job has no such pressure and uses the module
+#: default.
+INLINE_FARE_TIMEOUT = 2.0
 
 
 @dataclass(frozen=True)
@@ -99,6 +126,9 @@ class MailConfig:
     audience_id: str = ""
     welcome: bool = False
     cap_note: bool = False
+    day2: bool = False
+    day7: bool = False
+    dormant: bool = False
     #: Where `/email/unsubscribe` lives for the links we print. Defaults to
     #: this deployment's own origin; set `FREE_UNSUBSCRIBE_BASE` to
     #: `https://flightpowers.com` once the site proxies the route, so the
@@ -122,6 +152,12 @@ def load_mail_config(origin: str = "") -> MailConfig:
         welcome=(os.environ.get(WELCOME_ENV) or "").strip().lower()
         in {"1", "on", "true", "yes"},
         cap_note=(os.environ.get(CAPNOTE_ENV) or "").strip().lower()
+        in {"1", "on", "true", "yes"},
+        day2=(os.environ.get(DAY2_ENV) or "").strip().lower()
+        in {"1", "on", "true", "yes"},
+        day7=(os.environ.get(DAY7_ENV) or "").strip().lower()
+        in {"1", "on", "true", "yes"},
+        dormant=(os.environ.get(DORMANT_ENV) or "").strip().lower()
         in {"1", "on", "true", "yes"},
         unsubscribe_base=base,
     )
@@ -256,6 +292,26 @@ async def _post(
     timeout: float = 10.0,
 ) -> str:
     """One `POST /emails`. Returns SENT / REFUSED / UNKNOWN, never raises."""
+    outcome, _id = await post_email(
+        payload, config, label=label, client=client, timeout=timeout
+    )
+    return outcome
+
+
+async def post_email(
+    payload: dict,
+    config: MailConfig,
+    *,
+    label: str,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = 10.0,
+) -> tuple[str, str]:
+    """One `POST /emails`, with Resend's message id when there is one.
+
+    Same three outcomes as `_post` -- which is now a thin wrapper, because
+    the two event-driven sends have nowhere to put an id and the two
+    scheduled ones write it into `sent_emails`. Never raises.
+    """
     own_client = client is None
     client = client or httpx.AsyncClient(timeout=timeout)
     try:
@@ -269,24 +325,62 @@ async def _post(
         # The request may well have arrived. Treated as UNKNOWN, so the
         # claim stands and nobody gets two copies.
         logger.warning("%s send did not complete: %s", label, type(exc).__name__)
-        return UNKNOWN
+        return UNKNOWN, ""
     except Exception as exc:  # noqa: BLE001 - an email may never raise here
         logger.warning("%s send failed: %s", label, exc)
-        return UNKNOWN
+        return UNKNOWN, ""
     finally:
         if own_client:
             await client.aclose()
-    if response.status_code in (200, 201) and _json(response).get("id"):
-        logger.info("free-mcp %s accepted by Resend", label)
-        return SENT
+    body = _json(response)
+    message_id = str(body.get("id") or "")
+    if response.status_code in (200, 201) and message_id:
+        logger.info("free-mcp %s accepted by Resend as %s", label, message_id)
+        return SENT, message_id
+    # WHY the reason is logged and not just the status: between 09-13 and
+    # 09-16 three of nine real sign-ins never got a welcome and the log said
+    # only "welcome note send refused with N" -- which cannot tell a
+    # suppressed address from a rejected payload from a rate limit, so the
+    # bug could not be found from the logs at all (the 2026-09-17 read).
+    # Resend's own `name`/`message` answer that in one line. Addresses are
+    # masked out of the message: this line is read in a shared log.
     if 400 <= response.status_code < 500:
         # Resend answered and declined: a bad address, a suppressed one, a
         # rejected payload. Retrying the same message changes nothing today,
         # but the claim is released so a later trigger can.
-        logger.warning("%s send refused with %d", label, response.status_code)
-        return REFUSED
-    logger.warning("%s send returned %d", label, response.status_code)
-    return UNKNOWN
+        logger.warning(
+            "%s send refused with %d: %s", label, response.status_code, _reason(body)
+        )
+        return REFUSED, ""
+    logger.warning(
+        "%s send returned %d: %s", label, response.status_code, _reason(body)
+    )
+    return UNKNOWN, ""
+
+
+async def record_sent(store, google_sub: str, kind: str, resend_id: str) -> None:
+    """Write the ledger row that says a note actually went out.
+
+    The claims (`welcome_sent_at`, `cap_note_sent_at`) are stamped BEFORE
+    the Resend call, because that is the only thing that stops two
+    instances racing one trigger from sending twice. The cost of that
+    order is that a stamp cannot tell a delivered note from a lost one --
+    which is exactly how three silent welcome failures went unnoticed for
+    four days. This row closes that: it carries Resend's message id and is
+    written only after Resend accepted the note, so "claimed, no ledger
+    id" is a precise, queryable description of a lost send.
+
+    Best effort and never raises: the note has already gone out, and
+    failing to write the receipt must not look like failing to send.
+    """
+    try:
+        await store.claim_sent_email(google_sub, kind)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not claim the %s ledger row: %s", kind, exc)
+    try:
+        await store.finish_sent_email(google_sub, kind, resend_id or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not record the %s Resend id: %s", kind, exc)
 
 
 def _footer_text(link: str, monthly: bool = True) -> str:
@@ -322,8 +416,8 @@ WELCOME_PARAGRAPHS = [
     "One thing worth five minutes: {guide} - how to point an assistant at your "
     "own route and let it keep looking while you don't.",
     "If the ads or the cap get in the way there's a paid server, same tools, no "
-    "ads, and it runs on your own RapidAPI key. BASIC is free with 10 requests a "
-    "month, PRO is $10.",
+    "ads, and it runs on your own RapidAPI key. BASIC is free with 50 requests a "
+    "month on flights (10 on hotels), PRO is $10.",
     "Matan",
 ]
 
@@ -344,8 +438,8 @@ WELCOME_HTML_FLOW = [
     "route and let it keep looking while you don't.",
     ":::cta",
     "If the ads or the cap get in the way there's a paid server, same tools, no "
-    "ads, and it runs on your own RapidAPI key. BASIC is free with 10 requests a "
-    "month, PRO is $10.",
+    "ads, and it runs on your own RapidAPI key. BASIC is free with 50 requests a "
+    "month on flights (10 on hotels), PRO is $10.",
 ]
 
 WELCOME_PREHEADER = (
@@ -401,6 +495,19 @@ def _welcome_parts(day_cap: int, month_cap: int, link: str) -> tuple[str, str]:
     return text, html
 
 
+def welcome_parts(day_cap: int, month_cap: int, link: str) -> tuple[str, str, str]:
+    """Subject, plain text, HTML -- the welcome note, for any sender.
+
+    The sign-in callback is not the only thing that sends this note any
+    more: the daily job retries it for an account whose first attempt
+    never reached Resend (`sequence.KIND_WELCOME`). Both render through
+    here, so a retry is the same bytes and not a second version of the
+    welcome.
+    """
+    text, html = _welcome_parts(day_cap, month_cap, link)
+    return WELCOME_SUBJECT.format(day_cap=f"{day_cap:,}"), text, html
+
+
 async def send_welcome(
     email: str,
     token: str,
@@ -442,12 +549,41 @@ async def welcome_outcome(
     client: httpx.AsyncClient | None = None,
     timeout: float = 10.0,
 ) -> str:
+    """The outcome only. `welcome_send` when the message id is wanted."""
+    outcome, _id = await welcome_send(
+        email,
+        token,
+        config,
+        day_cap=day_cap,
+        month_cap=month_cap,
+        client=client,
+        timeout=timeout,
+    )
+    return outcome
+
+
+async def welcome_send(
+    email: str,
+    token: str,
+    config: MailConfig,
+    *,
+    day_cap: int,
+    month_cap: int,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = 10.0,
+) -> tuple[str, str]:
+    """The welcome note, with Resend's message id when it was accepted.
+
+    The id is what `record_sent` writes into the ledger, and the ledger is
+    what makes a lost send visible rather than indistinguishable from a
+    delivered one.
+    """
     address = (email or "").strip().lower()
     if not address or "@" not in address or not config.can_send or not config.welcome:
-        return REFUSED
+        return REFUSED, ""
     link = unsubscribe_url(config, token)
     text, html = _welcome_parts(day_cap, month_cap, link)
-    return await _post(
+    return await post_email(
         {
             "from": FROM_ADDRESS,
             "reply_to": FROM_ADDRESS,
@@ -472,48 +608,20 @@ async def welcome_outcome(
 
 # ── phase 2: the cap note ────────────────────────────────────────────────
 
-#: Sequence file (b). Two openers, one body, one send. Branch D is the
-#: person whose scan was cut off; branch M is a steady user with no acute
-#: pain, and opening branch M with "your scan stopped halfway" would be a
-#: lie about something they can check.
-BRANCH_DAILY = "D"
-BRANCH_MONTHLY = "M"
+#: The copy itself lives in `email_templates/ladder.py`, which is the one
+#: place the reviewed bytes of the cap note exist -- this module and
+#: `sequence.py` (the daily job) both render through it, so the inline path
+#: and the job can never drift into two different notes. That drift was
+#: real: until 2026-09-17 the job's fixed text opened "you hit the free
+#: daily cap twice this week" while its candidate filter selected anybody
+#: refused ONCE today, so a first-time capper would have been told
+#: something untrue (CLAUDE.md rule 1).
+BRANCH_DAILY = ladder.BRANCH_DAILY
+BRANCH_MONTHLY = ladder.BRANCH_MONTHLY
+CAP_SUBJECTS = ladder.CAP_SUBJECTS
+CAP_OPENERS = ladder.CAP_OPENERS
 
-CAP_SUBJECTS = {
-    BRANCH_DAILY: "your scan stopped halfway",
-    BRANCH_MONTHLY: "more room on your routes",
-}
-
-CAP_OPENERS = {
-    BRANCH_DAILY: (
-        "You hit the free daily cap twice this week, which means a scan "
-        "stopped before it finished."
-    ),
-    BRANCH_MONTHLY: (
-        "You're about two thirds through this month's free searches and "
-        "there's still {days_left} days of the month to go."
-    ),
-}
-
-#: Exactly ONE URL in the note, chosen by what the account actually
-#: searched. The PRO request number differs per listing, so the two travel
-#: together and cannot drift apart.
-CAP_PRODUCTS = {
-    "flights": ("https://flights.flightpowers.com/mcp", "2,500"),
-    "hotels": ("https://hotels.flightpowers.com/mcp", "2,000"),
-}
-
-CAP_PARAGRAPHS = [
-    "Hi,",
-    "{opener}",
-    "There's a paid server with the same tools, no ads and no daily cap. You "
-    "sign in with the same Google account you used on the free one, paste a "
-    "RapidAPI key once, and it's done. BASIC is free with 10 requests a month, "
-    "PRO is $10 for {requests} requests. Billed to your own plan.",
-    "{url}",
-    "If that's not worth it to you, tell me what would be. I read every reply.",
-    "Matan",
-]
+CAP_PRODUCTS = ladder.CONNECT_PRODUCTS
 
 
 def cap_note_branch(
@@ -550,79 +658,36 @@ def cap_note_product(signals: CapSignals) -> str:
     return "hotels" if signals.hotel_majority else "flights"
 
 
-#: The cap-note copy, re-split for the designed HTML part the same way the
-#: welcome is: the standalone URL paragraph becomes the one button, and the
-#: account's own month-to-date usage becomes the hero. Every sentence is
-#: still the sequence file's.
-CAP_HTML_FLOW = [
-    "Hi,",
-    "{opener}",
-    ":::hero",
-    "There's a paid server with the same tools, no ads and no daily cap. You "
-    "sign in with the same Google account you used on the free one, paste a "
-    "RapidAPI key once, and it's done. BASIC is free with 10 requests a month, "
-    "PRO is $10 for {requests} requests. Billed to your own plan.",
-    ":::cta",
-    "If that's not worth it to you, tell me what would be. I read every reply.",
-]
-
-CAP_PREHEADERS = {
-    BRANCH_DAILY: "The paid server has the same tools, no ads and no daily cap.",
-    BRANCH_MONTHLY: "The paid server has the same tools, no ads and no daily cap.",
-}
-
-CAP_HERO_EYEBROW = "your month so far"
-CAP_HERO_LABEL = "of {month_cap} free searches this month"
-CAP_CTA_LABEL = "Set up the paid server"
-
-CAP_FOOTER_LINES = [
-    "You're getting this because you signed in to the free FlightPowers MCP server.",
-    "About one email a month, nothing else.",
-]
-
-
-def _cap_hero(signals: CapSignals, month_cap: int) -> Hero | None:
-    """Their own usage, or no hero at all.
-
-    The number in this card is the one thing in the note the reader can
-    check against their own logs, so it is their month-to-date searches and
-    nothing else. When we have no count -- an account whose capped days were
-    last month, or a store that answered 0 -- the block is dropped rather
-    than printed as a zero: a hero that says 0 is worse than no hero.
-    """
-    if signals.month_searches <= 0 or month_cap <= 0:
-        return None
-    return Hero(
-        eyebrow=CAP_HERO_EYEBROW,
-        number=f"{signals.month_searches:,}",
-        label=CAP_HERO_LABEL.format(month_cap=f"{month_cap:,}"),
-    )
-
-
 def _cap_parts(
-    branch: str, signals: CapSignals, link: str, month_cap: int = 0
+    branch: str,
+    signals: CapSignals,
+    link: str,
+    month_cap: int = 0,
+    *,
+    day_cap: int = 0,
+    gift_fare: str = "",
+    first_name: str = "",
 ) -> tuple[str, str, str]:
-    """Subject, plain text, HTML. The text is the approved copy verbatim."""
+    """Subject, plain text, HTML. The copy is the ladder's, verbatim."""
     product = cap_note_product(signals)
     url, requests = CAP_PRODUCTS[product]
-    opener = CAP_OPENERS[branch].format(days_left=signals.days_left_in_month)
-    fields = {"opener": opener, "requests": requests}
-    text_paras = [para.format(url=url, **fields) for para in CAP_PARAGRAPHS]
-    footer = _footer_text(link, monthly=False)
-    text = "\n\n".join(text_paras) + "\n\n--\n" + footer + "\n"
-    html = _branded(
-        BrandedEmail(
-            subject=CAP_SUBJECTS[branch],
-            preheader=CAP_PREHEADERS[branch],
-            paragraphs=[para.format(**fields) for para in CAP_HTML_FLOW],
-            hero=_cap_hero(signals, month_cap),
-            cta=Cta(label=CAP_CTA_LABEL, url=url),
-            signoff=["Matan"],
-            footer_lines=list(CAP_FOOTER_LINES),
-            unsubscribe_url=link,
-        )
+    parts = ladder.cap_note(
+        unsubscribe_url=link,
+        connect_url=url,
+        pro_requests=requests,
+        basic_requests=ladder.BASIC_REQUESTS[product],
+        branch=branch,
+        first_name=first_name,
+        # Hotels drops the fare bracket: the sentence it sits in is about a
+        # round trip, and a flight price in a hotels note is a non sequitur
+        # (the upsell file says so explicitly).
+        gift_fare=gift_fare if product == "flights" else "",
+        day_cap=day_cap,
+        days_left=signals.days_left_in_month,
+        month_searches=signals.month_searches,
+        month_cap=month_cap,
     )
-    return CAP_SUBJECTS[branch], text, html
+    return parts.subject, parts.text, parts.html
 
 
 async def send_cap_note(
@@ -633,6 +698,9 @@ async def send_cap_note(
     branch: str,
     signals: CapSignals,
     month_cap: int = 0,
+    day_cap: int = 0,
+    gift_fare: str = "",
+    first_name: str = "",
     client: httpx.AsyncClient | None = None,
     timeout: float = 10.0,
 ) -> bool:
@@ -649,6 +717,9 @@ async def send_cap_note(
             branch=branch,
             signals=signals,
             month_cap=month_cap,
+            day_cap=day_cap,
+            gift_fare=gift_fare,
+            first_name=first_name,
             client=client,
             timeout=timeout,
         )
@@ -667,9 +738,49 @@ async def cap_note_outcome(
     #: month". Zero drops the card rather than printing a denominator we
     #: are not sure of.
     month_cap: int = 0,
+    #: The live per-user day cap, quoted in branch D's opener. The copy
+    #: reads it from settings rather than carrying a literal, so a cap
+    #: change can never leave the note quoting the old one.
+    day_cap: int = 0,
+    #: ` (164$ TLV to Athens nonstop both ways, one call)`, priced at send
+    #: time, or "" -- in which case the bracket is simply not printed.
+    #: Never a fare from an earlier send (CLAUDE.md rule 1).
+    gift_fare: str = "",
+    first_name: str = "",
     client: httpx.AsyncClient | None = None,
     timeout: float = 10.0,
 ) -> str:
+    outcome, _id = await cap_note_send(
+        email,
+        token,
+        config,
+        branch=branch,
+        signals=signals,
+        month_cap=month_cap,
+        day_cap=day_cap,
+        gift_fare=gift_fare,
+        first_name=first_name,
+        client=client,
+        timeout=timeout,
+    )
+    return outcome
+
+
+async def cap_note_send(
+    email: str,
+    token: str,
+    config: MailConfig,
+    *,
+    branch: str,
+    signals: CapSignals,
+    month_cap: int = 0,
+    day_cap: int = 0,
+    gift_fare: str = "",
+    first_name: str = "",
+    client: httpx.AsyncClient | None = None,
+    timeout: float = 10.0,
+) -> tuple[str, str]:
+    """The cap note, with Resend's message id when it was accepted."""
     address = (email or "").strip().lower()
     if (
         not address
@@ -678,10 +789,18 @@ async def cap_note_outcome(
         or not config.cap_note
         or branch not in CAP_SUBJECTS
     ):
-        return REFUSED
+        return REFUSED, ""
     link = unsubscribe_url(config, token)
-    subject, text, html = _cap_parts(branch, signals, link, month_cap)
-    return await _post(
+    subject, text, html = _cap_parts(
+        branch,
+        signals,
+        link,
+        month_cap,
+        day_cap=day_cap,
+        gift_fare=gift_fare,
+        first_name=first_name,
+    )
+    return await post_email(
         {
             "from": FROM_ADDRESS,
             "reply_to": FROM_ADDRESS,
@@ -707,6 +826,7 @@ async def maybe_send_cap_note(
     config: MailConfig,
     *,
     month_cap: int,
+    day_cap: int = 0,
     now: float | None = None,
 ) -> str | None:
     """Evaluate the triggers and, if one fires, send exactly one cap note.
@@ -756,15 +876,28 @@ async def maybe_send_cap_note(
         return None
     if not claimed:
         return None
-    outcome = await cap_note_outcome(
+    # The one live number, fetched AFTER the claim so a fare lookup can
+    # never be the thing that spends a send. TWO seconds and not the
+    # module default: this runs in the task that follows a tool call, on
+    # an instance that may be frozen at any moment, so every second spent
+    # on a fare is a second the NOTE can be lost in. A lookup that misses
+    # the window costs the bracket (empty string) and nothing else -- the
+    # note goes out without that sentence rather than not going out.
+    gift = await gift_fare_bracket(timeout=INLINE_FARE_TIMEOUT)
+    outcome, sent_id = await cap_note_send(
         row.email,
         row.unsubscribe_token,
         config,
         branch=branch,
         signals=signals,
         month_cap=month_cap,
+        day_cap=day_cap,
+        gift_fare=gift,
+        first_name=first_name_from_email(row.email),
     )
     if outcome == SENT:
+        stamp = now if now is not None else time.time()
+        await record_sent(store, google_sub, cap_kind(stamp), sent_id)
         return branch
     if outcome == REFUSED:
         try:
@@ -783,6 +916,25 @@ def _headers(config: MailConfig) -> dict[str, str]:
         # explicitly so the reason it works is written down.
         "user-agent": _USER_AGENT,
     }
+
+
+#: Anything that looks like an address, out of a log line.
+_ADDRESS = re.compile(r"[\w.+-]+@[\w.-]+")
+
+
+def _reason(body: dict) -> str:
+    """Resend's own `name` and `message`, masked and clipped.
+
+    Empty when Resend said nothing useful, and never an exception: this is
+    a log line inside an error path and it may not become the error.
+    """
+    try:
+        name = str(body.get("name") or "").strip()
+        message = str(body.get("message") or body.get("error") or "").strip()
+    except Exception:  # noqa: BLE001 - a log line may never raise
+        return "no reason in the body"
+    text = " ".join(part for part in (name, message) if part)[:200]
+    return _ADDRESS.sub("<address>", text) or "no reason in the body"
 
 
 def _json(response: httpx.Response) -> dict:
@@ -805,25 +957,33 @@ async def remember_signin(
 ) -> str:
     """The whole first-sign-in hand-off, in the order that cannot mis-fire.
 
-    1. Sync the contact IF phase 2 is switched on. A Resend `unsubscribed`
-       becomes `email_opt_out` locally, so our own transactional sends stop
-       for that address too -- an opt-out expressed anywhere means opted out
-       everywhere.
-    2. CLAIM the welcome, then send it, IF `FREE_SIGNIN_WELCOME=on` and the
+    1. CLAIM the welcome, then send it, IF `FREE_SIGNIN_WELCOME=on` and the
        address has not opted out. Claim first: `mark_welcome_sent` is an
        `UPDATE ... WHERE welcome_sent_at IS NULL` and its row count is the
        only thing that can tell two instances racing one first sign-in apart.
        Sending first and stamping after leaves a window in which both send.
+    2. Sync the contact IF phase 2 is switched on. An address Resend
+       already holds as `unsubscribed` is never re-POSTed (that call
+       UPSERTS and would resurrect it); the row simply stays `skipped`.
     3. Record what happened.
 
-    Best effort throughout. Called from a background task; a failure leaves
-    the row `pending` and the next first-sign-in for that account -- which
-    normally never happens -- would retry it.
-    """
-    state = RESEND_SKIPPED
-    if config.can_sync:
-        state = await sync_contact(email, config)
+    **The welcome goes FIRST, and that is a fix, not a preference** (found
+    2026-09-17). Until now the audience sync ran first: one or two HTTP
+    round trips to Resend's contacts API BEFORE the note was even claimed.
+    All of this runs in a task created after the sign-in response has
+    already been sent, and a serverless instance is frozen the moment it
+    answers -- so every second spent on the sync is a second in which the
+    welcome can be lost, and it is lost silently, leaving
+    `welcome_sent_at` NULL with no error anywhere. Three of nine real
+    sign-ins between 09-13 and 09-16 ended in exactly that state, all of
+    them after the audience id was configured on 09-11. The sync is the
+    part that can wait for tomorrow; the welcome is the part a person is
+    waiting for. `sequence.KIND_WELCOME` is the belt for whatever still
+    slips through.
 
+    Best effort throughout. Called from a background task; a failure leaves
+    the row `pending` and the daily welcome retry picks the person up.
+    """
     opted_out = False
     try:
         row = await store.get(google_sub)
@@ -834,17 +994,28 @@ async def remember_signin(
     if not opted_out and config.welcome and config.can_send:
         try:
             if await store.mark_welcome_sent(google_sub):
-                outcome = await welcome_outcome(
+                outcome, message_id = await welcome_send(
                     email, token, config, day_cap=day_cap, month_cap=month_cap
                 )
-                if outcome == REFUSED:
+                if outcome == SENT:
+                    # The receipt. Without it a stamp cannot be told from a
+                    # lost send, which is what hid three silent failures.
+                    await record_sent(
+                        store, google_sub, WELCOME_KIND, message_id
+                    )
+                elif outcome == REFUSED:
                     # Resend answered and declined, so nothing is in flight
                     # and the claim is a lie. A timeout is NOT released: the
                     # message may have gone, and a second copy is worse than
-                    # none.
+                    # none -- and the ledger row that is now missing is how
+                    # the retry finds it.
                     await store.release_welcome(google_sub)
         except Exception as exc:  # noqa: BLE001
             logger.warning("welcome hand-off failed: %s", exc)
+
+    state = RESEND_SKIPPED
+    if config.can_sync:
+        state = await sync_contact(email, config)
 
     try:
         await store.set_resend_state(google_sub, state)

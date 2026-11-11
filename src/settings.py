@@ -9,8 +9,12 @@ must never take flight search down.
 """
 
 import ipaddress
+import logging
 import os
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_quotes(value: str) -> str:
@@ -129,6 +133,102 @@ DEFAULT_STAY22_CAMPAIGN = "free-mcp"
 DEFAULT_STAY22_BOOKING_AID = "1607597"
 
 
+
+#: The path this server is mounted at. It is a constant, not configuration --
+#: `src/oauth.MCP_PATH` and `src/hard_limit.DEFAULT_MCP_PATH` hardcode the same
+#: "/mcp", and the routes are registered against it.
+MCP_MOUNT_PATH = "/mcp"
+
+
+def _canonical_public_url(raw: str) -> str:
+    """The exact URL clients connect to, whatever shape ops typed.
+
+    WHY THIS EXISTS (production incident 2026-09-15). `MCP_PUBLIC_URL` was set
+    on Vercel to the bare origin, `https://google-flights-lulu.flightpowers.com`,
+    with no `/mcp`. Lulu hashes this string into the widget's
+    `_meta.ui.domain` (`sha256(url)[:32] + ".claudemcpcontent.com"`), and
+    claude.ai recomputes the same hash from the connector URL the user
+    actually added -- which ends in `/mcp`. The two disagreed, so claude.ai
+    rejected the widget on EVERY successful search:
+
+        [mcp-ext-apps-host] ui.domain validation failed for connector
+        "https://google-flights-lulu.flightpowers.com/mcp"
+
+    The user saw a red "Unable to reach FlightPowers" chip and a "problem
+    displaying content from FlightPowers" toast next to a perfectly good
+    answer, and -- the quiet half -- the result widget never rendered, so the
+    rendered-impression beacon never fired and CPM was structurally zero.
+
+    Served domain was sha256("https://google-flights-lulu.flightpowers.com"),
+    e002e8f5...; claude.ai wanted sha256(".../mcp"), da6de3ea...
+
+    So a bare origin (or a trailing slash, which hashes differently again) is
+    normalised here rather than trusted. The origin is unchanged by this, so
+    `site_origin` and the Google `redirect_uri` derived from it in
+    `server.build_server` are unaffected.
+    """
+    value = raw.strip().rstrip("/")
+    if not value:
+        return value
+    parts = urlsplit(value)
+    if not parts.netloc:
+        # Not a URL we can reason about; hand it back untouched rather than
+        # inventing a path. The startup log in __main__/api.index still
+        # prints the derived widget domain.
+        return value
+    if parts.path in ("", "/"):
+        fixed = urlunsplit(
+            (parts.scheme, parts.netloc, MCP_MOUNT_PATH, parts.query, parts.fragment)
+        )
+        logger.warning(
+            "MCP_PUBLIC_URL was %r, which has no path. Clients connect to "
+            "%s, and the Lulu widget domain is a hash of this exact string -- "
+            "a mismatch makes claude.ai refuse to render the result widget "
+            "('Unable to reach FlightPowers') and drops CPM to zero. Using %r.",
+            raw,
+            MCP_MOUNT_PATH,
+            fixed,
+        )
+        return fixed
+    return value
+
+
+def _host_of(url: str) -> str:
+    """The `Host` a client sends when it connects to `url`, lowercased."""
+    return urlsplit(url).netloc.lower()
+
+
+#: The port a scheme implies, which a `Host` header may or may not spell out.
+_DEFAULT_PORTS = {"https": "443", "http": "80"}
+
+
+def _authority(value: str, scheme: str) -> str:
+    """`value` lowercased with the scheme's DEFAULT port removed, if present.
+
+    `Host: example.com` and `Host: example.com:443` are the same authority on
+    https, and a client may send either. Only the default port is dropped:
+    stripping every port would make `localhost:9000` match a server published
+    on `localhost:8000`, which is a different server.
+    """
+    value = value.strip().lower()
+    default = _DEFAULT_PORTS.get(scheme.strip().lower())
+    if default and value.endswith(f":{default}"):
+        return value[: -(len(default) + 1)]
+    return value
+
+
+def host_matches(url: str, host: str) -> bool:
+    """Whether a request `Host` names the server at `url`.
+
+    Exact on the hostname and on any non-default port; forgiving only about
+    a default port being spelled out on one side and not the other.
+    """
+    parts = urlsplit(url)
+    if not parts.netloc or not host.strip():
+        return False
+    return _authority(host, parts.scheme) == _authority(parts.netloc, parts.scheme)
+
+
 @dataclass(frozen=True)
 class Settings:
     # ── Backend (the API Lambda this server proxies to) ──────────────────
@@ -141,8 +241,10 @@ class Settings:
 
     # ── Lulu ads ─────────────────────────────────────────────────────────
     # public_url MUST exactly match the URL clients connect to. Lulu derives
-    # Claude's `_meta.ui.domain` from it, and the widget SILENTLY never
-    # renders on a mismatch -- which means $0 CPM with no error anywhere.
+    # Claude's `_meta.ui.domain` from it, and the widget never renders on a
+    # mismatch -- $0 CPM, plus (on claude.ai since at least 2026-09-15) a red
+    # "Unable to reach FlightPowers" chip on every successful search.
+    # Normalised by `_canonical_public_url`, which is where the story is.
     public_url: str
     lulu_publisher_id: str
     lulu_api_key: str
@@ -301,7 +403,92 @@ class Settings:
     # `stay22_aid` is set, same as everything else in this section.
     stay22_booking_aid: str = DEFAULT_STAY22_BOOKING_AID
 
+    # ── other hostnames that reach this same deployment ──────────────────
+    # The free server was published as `google-flights-lulu.flightpowers.com`
+    # and is being republished as `free-trial.flightpowers.com` (Matan,
+    # 2026-09-15: "keep the old one for old users, but update everywhere for
+    # the new one"). Both hostnames are aliases of ONE Vercel deployment, and
+    # a connector added on either has to keep working forever -- an MCP
+    # connector URL is saved in the client and is not re-typed.
+    #
+    # That makes several values PER HOST rather than per deployment, because
+    # they are compared byte-for-byte against the host the client used:
+    #
+    #   * the Lulu widget's `ui.domain` -- sha256 of the connector URL, which
+    #     claude.ai recomputes from the URL the user added (see
+    #     `_canonical_public_url` for the incident this cost us);
+    #   * the OAuth issuer and its authorization/token/registration
+    #     endpoints, and the RFC 9728 `resource_metadata` in a 401;
+    #   * the Google `redirect_uri` (Google compares it literally, so both
+    #     `/connect/callback` URLs are registered in the Cloud Console).
+    #
+    # Everything a PERSON reads -- the 401 directions, the account page, the
+    # emails -- keeps printing `public_url`, so an old user learns the new
+    # name rather than having it hidden from them.
+    #
+    # `MCP_PUBLIC_URL_ALIASES` is comma-separated and each entry goes through
+    # `_canonical_public_url`, so a bare origin or a trailing slash is
+    # corrected the same way the canonical one is.
+    public_url_aliases: tuple[str, ...] = ()
+
+    def public_url_for_host(self, host: str) -> str:
+        """The connector URL for the host this request arrived on.
+
+        Exact host match against the canonical URL and the aliases; anything
+        else -- a preview deployment, a health check with no `Host`, a
+        hostname pointed at us that we do not know about -- falls back to the
+        canonical URL, which is the answer that was correct before aliases
+        existed.
+        """
+        if not (host or "").strip():
+            return self.public_url
+        for url in (self.public_url, *self.public_url_aliases):
+            if host_matches(url, host):
+                return url
+        return self.public_url
+
+    @property
+    def public_hosts(self) -> tuple[str, ...]:
+        """Every hostname this deployment answers to, canonical first."""
+        return tuple(
+            _host_of(u) for u in (self.public_url, *self.public_url_aliases)
+        )
+
+    @property
+    def public_origins(self) -> tuple[str, ...]:
+        """scheme://host for each of `public_hosts`, canonical first."""
+        out = []
+        for url in (self.public_url, *self.public_url_aliases):
+            parts = urlsplit(url)
+            if parts.netloc:
+                out.append(f"{parts.scheme}://{parts.netloc}")
+        return tuple(out)
+
+
+def _public_url_aliases(canonical: str) -> tuple[str, ...]:
+    """`MCP_PUBLIC_URL_ALIASES`, canonicalised and deduped.
+
+    The canonical URL is dropped if somebody lists it here too, and so is a
+    second entry on a host we have already seen: the host is the key, and two
+    URLs for one host would make `public_url_for_host` depend on order.
+    """
+    seen = {_host_of(canonical)}
+    out: list[str] = []
+    for raw in _csv("MCP_PUBLIC_URL_ALIASES"):
+        url = _canonical_public_url(raw)
+        host = _host_of(url)
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        out.append(url)
+    return tuple(out)
+
+
 def load_settings() -> Settings:
+    # Canonical first: the aliases are deduped against its host.
+    _public_url = _canonical_public_url(
+        _env_str("MCP_PUBLIC_URL", "http://localhost:8000/mcp")
+    )
     mode = _env_str("ENFORCEMENT_MODE", "monitor").strip().lower()
     if mode not in {"off", "monitor", "enforce"}:
         raise RuntimeError(
@@ -335,7 +522,8 @@ def load_settings() -> Settings:
                                           DEFAULT_TIMEOUT_SECONDS),
         hotels_lambda_url=_env_str("HOTELS_LAMBDA_URL", "").rstrip("/"),
         hotels_auth=_env_str("HOTELS_AUTH", ""),
-        public_url=_env_str("MCP_PUBLIC_URL", "http://localhost:8000/mcp"),
+        public_url=_public_url,
+        public_url_aliases=_public_url_aliases(_public_url),
         lulu_publisher_id=_env_str("LULU_ADS_PUBLISHER_ID", ""),
         lulu_api_key=_env_str("LULU_ADS_API_KEY", ""),
         ads_enabled=_env_bool("ADS_ENABLED", True),
@@ -346,8 +534,14 @@ def load_settings() -> Settings:
         max_http_connections=_env_int("MAX_HTTP_CONNECTIONS", 60),
         daily_backend_call_budget=_env_int("DAILY_BACKEND_CALL_BUDGET", 0),
         budget_degrade_at=_env_float("BUDGET_DEGRADE_AT", 0.8),
-        fair_use_day_cap=_env_int("FAIR_USE_DAY_CAP", 150),
-        fair_use_month_cap=_env_int("FAIR_USE_MONTH_CAP", 2000),
+        # 50/250 since 2026-09-15, which is what production enforces
+        # (`FAIR_USE_DAY_CAP=50` / `FAIR_USE_MONTH_CAP=250` on
+        # mcp_server_lulu, set for the Hebrew LinkedIn post). The code
+        # default sat at the old 150/2,000 for two days after that, which
+        # is the sort of thing that only bites when the env var is
+        # missing -- and then a note quotes an allowance nobody has.
+        fair_use_day_cap=_env_int("FAIR_USE_DAY_CAP", 50),
+        fair_use_month_cap=_env_int("FAIR_USE_MONTH_CAP", 250),
         # UNCHANGED at 1500/10000, deliberately, and this is the one place
         # the anonymous taster cap does not reach. A pooled gateway key
         # stands for an unknown number of real people behind one connection

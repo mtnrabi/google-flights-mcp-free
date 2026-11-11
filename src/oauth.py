@@ -101,7 +101,7 @@ import logging
 import os
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
@@ -496,7 +496,7 @@ class OAuthSupport:
 
     store: OAuthStore
     auth: Any               # webauth.GoogleWebAuth -- the browser sign-in
-    origin: str             # this deployment's canonical scheme+host
+    origin: str             # the scheme+host THIS instance speaks for
     product: str
     #: freeusers.FreeUserStore -- the row per signed-in account. Not a
     #: credential store: see that module's header for what is and is not in
@@ -504,6 +504,88 @@ class OAuthSupport:
     users: Any = None
     #: maillist.MailConfig -- the welcome note and the phase-2 contact sync.
     mail: Any = None
+    #: Every scheme+host this deployment answers on, CANONICAL FIRST -- the
+    #: one in `settings.public_url` plus `settings.public_url_aliases`. An
+    #: instance built for an alias carries the same tuple, so the list does
+    #: not depend on which hostname you arrived through.
+    origins: tuple[str, ...] = ()
+    #: Per-host copies of this object, built lazily by `for_host`. A dict on
+    #: a frozen dataclass is fine: the field is never reassigned, and the
+    #: values are immutable once built. `compare=False` keeps it out of
+    #: equality, which is what tests compare on.
+    _variants: dict = field(
+        default_factory=dict, compare=False, repr=False
+    )
+
+    # ── one deployment, several hostnames ────────────────────────────────
+
+    def known_origins(self) -> tuple[str, ...]:
+        """Canonical first, with `self.origin` guaranteed present.
+
+        `origins` is empty on an instance built before aliases existed (and
+        in a test that constructs one by hand), and the answer there is the
+        single origin it was given.
+        """
+        return self.origins or (self.origin,)
+
+    def knows_host(self, host: str) -> bool:
+        """Whether `host` is a hostname this deployment publishes.
+
+        The question `_wrong_host` in src/oauthroutes.py asks: a published
+        hostname serves itself, anything else is redirected home before a
+        cookie is set or a Google flow is started.
+        """
+        from .settings import host_matches  # noqa: PLC0415 -- flat import graph
+
+        return any(host_matches(o, host) for o in self.known_origins())
+
+    def for_host(self, host: str) -> "OAuthSupport":
+        """The instance that speaks for the hostname this request arrived on.
+
+        WHY. The free server answers on more than one hostname
+        (`free-trial.flightpowers.com` since 2026-09-15, and
+        `google-flights-lulu.flightpowers.com` for every connector added
+        before it). Three values are compared byte-for-byte against the host
+        the client used, so they cannot be one deployment-wide string:
+
+          * the OAuth `issuer` and its endpoints -- a client that discovered
+            us on one host and is then redirected to another has changed
+            authorization server mid-flow;
+          * the RFC 9728 `resource_metadata` URL in the 401 challenge, which
+            the client follows literally;
+          * the Google `redirect_uri` (`/connect/callback`), which Google
+            compares literally and refuses on a mismatch.
+
+        An unknown `Host` -- a preview URL, a probe with none -- gets the
+        canonical instance, which is the behaviour that existed before
+        aliases did.
+
+        `store`, `users` and `mail` are SHARED on purpose: one registry, one
+        account table, one product-updates list. Only the identity of the
+        server changes, never whose account it is. `mail` in particular keeps
+        the canonical unsubscribe base, because an email is text a person
+        reads and should name the new hostname.
+        """
+        from .settings import host_matches  # noqa: PLC0415 -- flat import graph
+
+        if not (host or "").strip():
+            return self
+        for origin in self.known_origins():
+            if not host_matches(origin, host):
+                continue
+            if origin.rstrip("/") == self.origin.rstrip("/"):
+                return self
+            cached = self._variants.get(origin)
+            if cached is None:
+                cached = replace(
+                    self,
+                    origin=origin.rstrip("/"),
+                    auth=self.auth.for_origin(origin),
+                    _variants={},
+                )
+                self._variants[origin] = cached
+            return cached
+        return self
 
     # ── forms ────────────────────────────────────────────────────────────
 
@@ -704,14 +786,22 @@ class OAuthSupport:
         """
         if not requested:
             return True
-        want = urlsplit(self.resource_url)
         got = urlsplit(requested.strip())
         if not got.scheme or not got.netloc:
             return False
-        if (got.scheme.lower(), got.netloc.lower()) != (
-            want.scheme.lower(),
-            want.netloc.lower(),
-        ):
+        # EVERY hostname this deployment answers on, not just this instance's
+        # (2026-09-15). A token minted before `free-trial.flightpowers.com`
+        # existed names the old host; the connectors holding those tokens are
+        # exactly the ones we promised would keep working. They are the same
+        # server, the same tools and the same account either way, so treating
+        # them as different resources would log six real users out for a
+        # rename. A host we do NOT answer on is still refused -- that is the
+        # confused-deputy case RFC 8707 exists for.
+        mine = {
+            (urlsplit(o).scheme.lower(), urlsplit(o).netloc.lower())
+            for o in self.known_origins()
+        }
+        if (got.scheme.lower(), got.netloc.lower()) not in mine:
             return False
         path = got.path.rstrip("/")
         return path in ("", MCP_PATH, MCP_OAUTH_PATH)
@@ -752,7 +842,7 @@ class OAuthSupport:
                 "the client metadata document lists no usable redirect_uris",
                 redirectable=False,
             )
-        if redirect_uri and redirect_uri not in allowed:
+        if redirect_uri and not _redirect_uri_registered(redirect_uri, allowed):
             raise OAuthError(
                 "invalid_request",
                 "that redirect_uri is not listed in the client metadata document",
@@ -995,10 +1085,9 @@ class OAuthSupport:
                     redirectable=False,
                 )
             redirect_uri = client.redirect_uris[0]
-        elif redirect_uri not in client.redirect_uris:
-            # Exact string match, not a prefix or a host match: a loose
-            # comparison here is how authorization codes get delivered to
-            # somebody else's URL.
+        elif not _redirect_uri_registered(redirect_uri, client.redirect_uris):
+            # Exact match, except the loopback port (RFC 8252 §7.3): see
+            # `_redirect_uri_registered`.
             raise OAuthError(
                 "invalid_request",
                 "That redirect_uri is not registered for this client.",
@@ -1533,7 +1622,53 @@ def _redirect_uri_allowed(uri: str) -> bool:
     return bool(parts.scheme) and ":" in uri and not uri.startswith(("javascript:", "data:"))
 
 
-def build_free_oauth(origin: str, product: str = "travel") -> "OAuthSupport | None":
+def _redirect_uri_registered(requested: str, registered: "tuple[str, ...] | list[str]") -> bool:
+    """Is `requested` one of the `registered` redirect_uris?
+
+    An exact string match, with the one exception RFC 8252 §7.3 makes: a
+    native client (Claude Code, MCP Inspector) opens its callback listener
+    on an ephemeral port and registers the loopback URI without one -- Claude
+    Code's metadata document lists `http://localhost/callback` and then signs
+    in on `http://localhost:53682/callback`. So for a loopback http URI the
+    PORT is ignored; scheme, host, path and query must still match exactly,
+    and userinfo or a fragment is refused. Never a prefix or a host-only
+    match: a loose comparison here is how codes get delivered to somebody
+    else's URL.
+    """
+    if requested in registered:
+        return True
+    try:
+        got = urlsplit(requested)
+        got.port  # a non-numeric or out-of-range port raises ValueError
+    except ValueError:
+        return False
+    host = (got.hostname or "").lower()
+    if (
+        got.scheme != "http"
+        or host not in ("127.0.0.1", "::1", "localhost")
+        or got.username is not None
+        or got.password is not None
+        or got.fragment
+    ):
+        return False
+    for uri in registered:
+        reg = urlsplit(uri)
+        if (
+            reg.scheme == "http"
+            and (reg.hostname or "").lower() == host
+            and reg.username is None
+            and reg.path == got.path
+            and reg.query == got.query
+        ):
+            return True
+    return False
+
+
+def build_free_oauth(
+    origin: str,
+    product: str = "travel",
+    origins: tuple[str, ...] = (),
+) -> "OAuthSupport | None":
     """The sign-in feature for this deployment, or None.
 
     Returns None -- and the server then behaves exactly as it does today,
@@ -1572,7 +1707,13 @@ def build_free_oauth(origin: str, product: str = "travel") -> "OAuthSupport | No
         origin=origin.rstrip("/"),
         product=product,
         users=build_user_store(),
+        # Canonical, always. The unsubscribe link in an email is text a
+        # person reads, and it names the hostname we want them to learn.
         mail=load_mail_config(origin.rstrip("/")),
+        # Canonical first; `for_host` and `resource_matches` both read this.
+        origins=tuple(
+            o.rstrip("/") for o in (origins or (origin,)) if o.strip()
+        ),
     )
 
 
@@ -1663,6 +1804,15 @@ class OAuthResourceGate:
         scope = strip_identity_headers(scope)
         path = (scope.get("path") or "").rstrip("/") or "/"
         support = self.support
+        if support is not None:
+            # Per HOST, not per deployment (2026-09-15). The challenge this
+            # gate sends names an issuer and a `resource_metadata` URL, and a
+            # client follows both literally -- so a caller on the alias
+            # hostname must be challenged with the alias, or its sign-in
+            # walks off to a different origin than the one it connected to.
+            support = support.for_host(
+                _scope_headers(scope).get("host", "")
+            )
 
         if path == MCP_OAUTH_PATH:
             await self._guarded(scope, receive, send, support, mode="always")

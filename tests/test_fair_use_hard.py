@@ -35,6 +35,7 @@ import httpx
 import pytest
 
 from src.fair_use import (
+    PAID_TRIAL_DAY_CAP,
     GATEWAY_KINDS,
     KIND_DIRECT,
     KIND_GATEWAY_POOLED,
@@ -138,7 +139,8 @@ class TestTheHardBody:
     def test_hard_block_message_matches_the_body(self):
         assert hard_block_message(900, 150) == (
             "Free fair-use reached (150 searches/day). Retry after 900s, or "
-            "use the paid server (BASIC is free): sign in at "
+            f"use the paid server ({PAID_TRIAL_DAY_CAP} free ad-free searches "
+            "a day, no key): sign in at "
             f"{SIGNIN_FLIGHTS_URL}, or bring your own RapidAPI key at "
             f"{PAID_FLIGHTS_URL}, details: "
             "https://flightpowers.com/"
