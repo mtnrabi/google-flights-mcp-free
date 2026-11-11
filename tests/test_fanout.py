@@ -289,8 +289,13 @@ class TestUpgradePromptOnTruncation:
         assert "BASIC is free" in msg
         assert "free tier available" not in msg
         # The paid server's real numbers, not a promise it cannot keep.
-        assert "30" in msg and "60" in msg
+        # 2026-11-11: the paid cap rises by itself to 300 with a key (was
+        # "up to 60", stale since the auto raise), and the price is said here,
+        # the one moment the free cap bit.
+        assert "30" in msg and "300" in msg
+        assert "up to 60" not in msg
         assert "max_searches" in msg
+        assert "PRO is $10 a month for 2,500 searches" in msg
 
     def test_the_pitch_does_not_promise_an_uncapped_paid_tier(self):
         """The paid server caps fan-out at 30 by default and 60 hard

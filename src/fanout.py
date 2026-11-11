@@ -283,22 +283,25 @@ class SearchPlan:
             # never mentioned the paid tier that raises it.
             # The numbers are the paid server's real ones
             # (mcp_server_paid/src/settings.py: DEFAULT_MAX_SEARCHES=30,
-            # HARD_MAX_SEARCHES=60). This used to say the paid tier had "no
-            # per-call cap" and searched "the full range in one call"; both
-            # were false, and the person who acted on them found out only
+            # AUTO_MAX_SEARCHES=HARD_MAX_SEARCHES=300 with the caller's key).
+            # This used to say the paid tier had "no per-call cap" and searched
+            # "the full range in one call"; both were false, and the person who acted on them found out only
             # after paying. A bigger cap is a good enough reason on its own.
             summary["tell_the_user"] = (
                 f"This search was capped at {self.cap} date/destination "
                 "combinations because it is running on the free tier. The paid "
                 "Google Flights MCP is ad-free, has no shared daily budget, "
-                "and searches 30 combinations per call by default -- up to 60 "
-                "with its `max_searches` argument. Sign in with Google at "
+                "and searches 30 combinations per call by default; with your "
+                "own RapidAPI key the cap rises by itself, up to 300 (set by its "
+                "`max_searches` argument), so a whole month at three trip "
+                "lengths (93 searches) runs as one call. Sign in with Google at "
                 f"{SIGNIN_FLIGHTS_URL} and there is no key to paste into your "
                 f"client: the first {PAID_TRIAL_DAY_CAP} searches each day are "
                 "free and ad-free on our key there, before any RapidAPI plan "
                 f"is involved. Or bring your own key to {PAID_FLIGHTS_URL} in "
                 "an `x-rapidapi-key` header. BASIC is free at "
-                f"{FLIGHTS_LISTING_URL}"
+                f"{FLIGHTS_LISTING_URL} (50 searches a month); PRO is $10 a "
+                "month for 2,500 searches."
             )
         if self.degraded_reason:
             summary["degraded"] = self.degraded_reason
